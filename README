@@ -1,47 +1,57 @@
-Rennari Client JS
-=================
+Mojo::Rennari
+=============
 
-JavaScript client for Mojo::Rennari, a small MessagePack/JSON WebSocket
-event framework for Mojolicious.
+Real-time WebSocket messaging for Mojolicious applications, named after
+the Old Norse rennari — "runner, messenger, envoy".
 
-Wire-compatible with the Perl server. Works in Node 18+ and any modern
-browser. No build step required.
+A small, secure, MessagePack- or JSON-framed event layer. Not a Socket.IO
+clone, not a drop-in replacement. It offers the features that matter for
+a Mojolicious app: custom events, rooms, namespaces, acknowledgements,
+reconnection, and connection state recovery.
 
 STATUS
 
-Working. The Perl server and this client are tested against each other.
-See mojo-rennari for the server.
+Working. Perl server and JavaScript client are wire-compatible and tested
+against each other. See rennari-client-js for the JavaScript side.
 
 INSTALL
 
-    npm install rennari-client-js
+    cpanm Mojo::Rennari
 
-Or clone and import directly from src.
+Or with carton:
+
+    carton install
 
 QUICK START
 
-    import { Rennari } from 'rennari-client-js';
+    use Mojolicious::Lite;
+    use Mojo::Rennari::Server;
 
-    const client = new Rennari('wss://example.com/ws?token=secret');
+    my $rennari = Mojo::Rennari::Server->new(
+        auth_cb => sub {
+            my $c = shift;
+            my $token = $c->param('token') // return undef;
+            return undef unless $token eq 'secret';
+            return { user_id => 42 };
+        },
+    );
 
-    client.on('connect', () => {
-        console.log('connected, session', client.sessionId);
-        client.emit('chat', { room: 'lobby', text: 'hi' });
+    $rennari->on('chat' => sub {
+        my ($c, $payload) = @_;
+        $c->rennari->join($payload->{room});
+        $c->rennari->broadcast_to_room($payload->{room}, 'chat', $payload);
     });
 
-    client.on('chat', (payload) => {
-        console.log(payload.text);
-    });
+    websocket '/ws' => sub {
+        my $c = shift;
+        $rennari->websocket_route($c);
+    };
 
-    client.on('disconnect', ({ code, reason }) => {
-        console.log('disconnected', code, reason);
-    });
+    app->start;
 
-    client.on('ack_timeout', ({ event, payload }) => {
-        console.warn('no ack for', event);
-    });
-
-    await client.connect();
+The client connects to /ws?token=secret and sends
+{e: 'chat', d: {room: 'lobby', text: 'hi'}}. Every member of lobby
+receives it, sender included.
 
 CORE CONCEPTS
 
@@ -49,173 +59,160 @@ Frames
 
 Every message is a map:
 
-    { e, d, id?, o?, n? }
+    { e => $event, d => $payload, id => $id?, o => $offset?, n => $namespace? }
 
-- e - event name
-- d - payload
-- id - optional acknowledgement id
-- o - optional offset, present when the server has recovery enabled
-- n - optional namespace, omitted for /
+- e — event name, [A-Za-z0-9_.:-]{1,64}
+- d — payload, any MessagePack- or JSON-encodable value
+- id — optional acknowledgement id
+- o — optional offset, present when recovery is enabled
+- n — optional namespace, omitted for /
 
-The client uses the same wire format as the Perl server. If the server
-is configured with serializer: 'json', the client must be too:
+Serialized as MessagePack by default, or JSON if configured. Binary
+WebSocket frames, always.
 
-    const client = new Rennari(url, { serializer: 'json' });
+Authentication
+
+auth_cb runs during the HTTP request, before the WebSocket upgrade. A
+falsy return renders 401 and no socket is opened. The returned identity
+is available to handlers via $c->stash('rennari_identity').
 
 Events
 
-    client.on(event, handler);
-    client.off(event, handler);
-    client.emit(event, payload);
+    $rennari->on('smile' => sub {
+        my ($c, $payload) = @_;
+        return { ok => 1 };
+    });
 
-Client-level events (on the default / namespace) are also the place where
-local lifecycle events fire:
+If the handler returns a value, it is sent back as {e: 'reply', d: $value}.
 
-    client.on('connect', () => {});
-    client.on('disconnect', ({ code, reason }) => {});
-    client.on('error', (err) => {});
-    client.on('ack_timeout', ({ event, payload }) => {});
-    client.on('reconnect_attempt', ({ attempt, delay }) => {});
-    client.on('reconnect_failed', () => {});
-    client.on('recovered', ({ offset }) => {});
+Handlers can send with a custom event name to one client, everyone, or a
+room:
+
+    $c->rennari->send_to_self('smile_back', { ok => 1 });    # to sender
+    $c->rennari->send_to($id, 'ping', { ... });              # to one id
+    $c->rennari->broadcast('system', { text => 'restart' }); # to all
+
+Rooms
+
+    $c->rennari->join('lobby');
+    $c->rennari->leave('lobby');
+    $c->rennari->broadcast_to_room('lobby', 'chat', $payload);
+    $c->rennari->members_of('lobby');   # arrayref of ids
+
+Rooms are per-namespace. lobby in /chat is not lobby in /admin. They
+auto-create on first join, disappear when the last member leaves. No
+policy in the framework: the application decides when to join or leave
+from its own handlers.
 
 Namespaces
 
-    const chat = client.of('/chat');
+Multiple logical channels over one WebSocket connection, like Socket.IO.
+Each namespace has its own handlers, rooms, and members.
 
-    chat.on('message', (payload) => {});
-    chat.emit('message', { text: 'hi' });
+    my $chat = $rennari->namespace('/chat');
+    $chat->on('message' => sub {
+        my ($c, $payload) = @_;
+        $c->rennari->broadcast_to_room('lobby', 'message', $payload);
+    });
 
-Every non-default namespace is declared to the server on connect and on
-reconnect. Incoming frames are dispatched by their n field, not by any
-connection state. A frame for a namespace the client has not joined on
-the server side causes a close with code 4005.
+A client joins with {e: 'rennari_nsp', d: {name: '/chat'}}. The server
+replies rennari_nsp_ok. Frames for a namespace the client has not joined
+close the connection with code 4005.
+
+Every frame the server sends carries the namespace in n. The client
+dispatches by that field, so no connection state is involved.
 
 Acknowledgements
 
-    const ack = await client.emitWithAck('chat', { text: 'hi' }, {
-        timeout: 3000,
-        retries: 2,
+A client can send an id with any event. The server replies
+{e: 'rennari_ack', d: {id: $id}} after the handler succeeds. If the
+handler dies, no ack is sent, and the client's retry loop resends.
+Duplicate delivery is possible; the framework does not deduplicate.
+Handlers should be idempotent if retries are used.
+
+Lifecycle hooks
+
+    $rennari->on_connect(sub { my ($c, $identity) = @_; });
+    $rennari->on_disconnect(sub { my ($c, $identity) = @_; });
+    $rennari->on_error(sub {
+        my ($c, $kind, $detail) = @_;
+        # $kind is 'bad_frame', 'unknown_event', or 'handler_error'
     });
 
-The client assigns an id, sends the frame, and waits for rennari_ack.
-If no ack arrives within timeout milliseconds, the frame is resent up to
-retries times. When retries are exhausted, the promise rejects and the
-ack_timeout local event fires.
-
-Duplicate delivery is possible by design: retries resend the same frame
-with the same id. Handlers on the server should be idempotent if the
-application uses retries.
-
-Reconnection
-
-On by default:
-
-    const client = new Rennari(url, {
-        reconnection: true,
-        reconnectionDelay: 1000,
-        reconnectionDelayMax: 5000,
-        reconnectionAttempts: Infinity,
-        reconnectionJitter: 0.5,
-    });
-
-When the WebSocket closes unexpectedly, the client reconnects with
-exponential backoff plus jitter. Before each attempt, reconnect_attempt
-fires. When attempts are exhausted, reconnect_failed fires. On successful
-reconnect, connect fires again.
-
-While disconnected, emit() queues the frame in an outbox. The queue is
-flushed on the next connect. If reconnection is off, emit() throws when
-not connected.
+Hooks that die are caught and logged; they cannot break the connection.
 
 Recovery
 
-When the server has recovery enabled, it issues a session id at
-handshake. The client stores it as client.sessionId and tracks the
-server's offset as client.lastOffset.
+    my $rennari = Mojo::Rennari::Server->new(
+        recovery        => 1,
+        recovery_window => 120,
+    );
 
-If the connection drops and reconnects within the server's recovery
-window (default 120 seconds), the client sends rennari_resume with the
-session id and last offset. The server replays missed frames, re-attaches
-namespaces and rooms, and replies rennari_resumed with the transferred
-session id. The client then fires the recovered local event.
+Off by default. When enabled, the server issues a private session id at
+handshake and tracks an offset on every outbound frame. If a connection
+drops, its session is kept for recovery_window seconds with any frames
+that would have been sent to it buffered. On reconnect, the client sends
+{e: 'rennari_resume', d: {session_id, offset}}. The server replays missed
+frames, re-attaches namespaces and rooms, and replies rennari_resumed.
+A session that is unknown, expired, or still attached to a live connection
+gets rennari_resume_failed.
 
-If the session has expired on the server, the server replies
-rennari_resume_failed, the client clears its session state, and connects
-fresh.
+Without recovery, no o field is present on any frame and no session
+frame is sent. Behavior is unchanged from the simple protocol.
 
-    const client = new Rennari(url, {
-        recovery: true,
-        recoveryWindow: 120000,
-    });
+Mock mode
 
-Both recovery and reconnection must be enabled for session recovery to
-work. Without reconnection, the client never tries to resume.
+    my $rennari = Mojo::Rennari::Server->new(mock => 1);
 
-DISCONNECT
-
-    client.disconnect();                  // 1000, 'client_disconnect'
-    client.disconnect(4000, 'user_exit'); // custom
-
-Intentional disconnect does not trigger reconnection.
-
-CONFIGURATION
-
-    new Rennari(url, {
-        serializer: 'msgpack',          // or 'json'
-        maxBytes: 64 * 1024,            // max incoming frame size
-        ackTimeout: 5000,               // ms, default per emitWithAck
-        retries: 3,                     // default per emitWithAck
-        reconnection: true,
-        reconnectionDelay: 1000,
-        reconnectionDelayMax: 5000,
-        reconnectionAttempts: Infinity,
-        reconnectionJitter: 0.5,
-        recovery: true,
-        recoveryWindow: 120000,
-    });
-
-NODE VERSUS BROWSER
-
-In the browser, globalThis.WebSocket exists. In Node 18 and 20, it does
-not, so the ws package must be provided:
-
-    import { WebSocket } from 'ws';
-    import { setWebSocket, Rennari } from 'rennari-client-js';
-    setWebSocket(WebSocket);
-
-Node 22+ has a built-in WebSocket and does not need the ws package.
-
-In both environments, binary WebSocket frames are used. binaryType is set
-to 'arraybuffer' by the transport.
+Skips auth_cb, synthesizes an identity, and ignores unknown events.
+Refused automatically when MOJO_MODE is production, unless
+force_mock => 1. For development only.
 
 CLOSE CODES
 
-The server closes with:
+- 4002 — bad frame (decoder rejected the bytes)
+- 4003 — unknown event (no handler registered, non-mock)
+- 4004 — handler died
+- 4005 — unknown namespace, or frame for a namespace the client has not joined
+- 4006 — recovery disabled but client sent rennari_resume
 
-- 4002 - bad frame
-- 4003 - unknown event
-- 4004 - handler error
-- 4005 - unknown namespace
-- 4006 - recovery disabled but client sent rennari_resume
+CONFIGURATION
 
-These arrive in the disconnect local event as { code, reason }.
+    my $rennari = Mojo::Rennari::Server->new(
+        auth_cb            => sub { ... },   # required in production
+        serializer         => 'msgpack',     # or 'json'
+        max_bytes          => 64 * 1024,     # max frame size
+        recovery           => 0,             # enable session recovery
+        recovery_window    => 120,           # seconds
+        inactivity_timeout => 300,           # seconds, overrides Mojo's 30s default
+        mock               => 0,             # development only
+        force_mock         => 0,             # overrides production refusal
+        logger             => Mojo::Log->new,
+    );
 
-EXAMPLES
+SECURITY
 
-A Node smoke test is in examples/node.mjs. It connects to a running Perl
-server, exercises custom events, namespaces, acks, and recovery across a
-forced disconnect.
+- Auth runs before the upgrade. Failed auth = 401, no socket opened.
+- Frames are validated on decode: event name grammar, id format, offset
+  format, namespace grammar, size limit. Any violation closes the
+  connection with a specific code.
+- Decoder never dies on untrusted input.
+- MessagePack max_bytes cap is checked before unpack.
+- The serializer is chosen per server, not per connection. A mismatch
+  fails decode like any other malformed frame.
+- mock is refused in production.
 
-    node examples/node.mjs <port>
+The framework does not implement rate limiting. If you expose the server
+publicly, add per-connection frame budgets at the application level, or
+use a reverse proxy.
 
-Integration tests in tests/integration.test.js do the same thing
-programmatically against a server spawned from the Perl repo:
+JAVASCRIPT CLIENT
 
-    RENNARI_PERL_DIR=/path/to/mojo-rennari npm test
-
-Tests are skipped if RENNARI_PERL_DIR is unset.
+The companion JavaScript client lives in rennari-client-js. It speaks the
+same wire format: MessagePack or JSON frames, namespaces by n, acks with
+id, session recovery with o and session_id. Works in Node 18+ and any
+modern browser.
 
 LICENSE
 
-MIT.
+Same terms as Perl itself.
