@@ -5,7 +5,7 @@ use Mojo::Rennari::Connection;
 use Mojo::Rennari::Namespace;
 use Mojo::IOLoop;
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 {
     no strict 'refs';
@@ -17,13 +17,14 @@ our $VERSION = '0.001';
 }
 
 has 'auth_cb';
-has 'mock'          => 0;
-has 'force_mock'    => 0;
-has 'max_bytes'     => 64 * 1024;
-has 'serializer'    => 'msgpack';
+has 'mock'            => 0;
+has 'force_mock'      => 0;
+has 'max_bytes'       => 64 * 1024;
+has 'serializer'      => 'msgpack';
 has 'logger';
-has 'recovery'      => 0;
+has 'recovery'        => 0;
 has 'recovery_window' => 120;
+has 'inactivity_timeout' => 300;
 
 has 'on_connect_cb';
 has 'on_disconnect_cb';
@@ -91,6 +92,11 @@ sub broadcast_to_room {
     return $self->namespace('/')->broadcast_to_room($room, $event, $payload);
 }
 
+sub broadcast {
+    my ($self, $event, $payload) = @_;
+    return $self->namespace('/')->broadcast($event, $payload);
+}
+
 sub members_of {
     my ($self, $room) = @_;
     return $self->namespace('/')->members_of($room);
@@ -107,10 +113,11 @@ sub rooms_of {
     return [sort keys %seen];
 }
 
-# send a frame to one connection, buffering if recovery is on and the
-# connection is in the disconnected-but-recoverable state
+# Send a frame to one connection, tagged with a namespace (default '/').
+# If recovery is on and the connection is offline, buffer it on the session.
 sub _send_to_connection {
-    my ($self, $id, $event, $payload) = @_;
+    my ($self, $id, $event, $payload, $nsp) = @_;
+    $nsp //= '/';
     my $conn = $self->_connections->{$id};
     my $s    = $self->serializer;
 
@@ -122,7 +129,7 @@ sub _send_to_connection {
                 $sess->{offset} = $next_offset;
             }
         }
-        my $bytes = encode_frame($event, $payload, $s, undef, $next_offset);
+        my $bytes = encode_frame($event, $payload, $s, undef, $next_offset, $nsp);
         eval { $conn->{tx}->send({binary => $bytes}) };
         $self->_log(warn => "rennari: send failed: $@") if $@;
         return 1;
@@ -132,8 +139,7 @@ sub _send_to_connection {
     return 0 unless $self->recovery;
     my $session = $self->_session_of($id) or return 0;
     my $offset  = ++$session->{offset};
-    my $bytes   = encode_frame($event, $payload, $s, undef, $offset);
-    my $offset  = ++$session->{offset};
+    my $bytes   = encode_frame($event, $payload, $s, undef, $offset, $nsp);
     push @{ $session->{buffered} }, { offset => $offset, bytes => $bytes };
     return 1;
 }
@@ -163,6 +169,9 @@ sub websocket_route {
         }
     }
 
+    # Mojolicious closes idle connections after 30s by default
+    $c->inactivity_timeout($self->inactivity_timeout);
+
     my $id      = ++$self->{_next_id};
     my $session = $self->_new_session_id;
     my $conn    = Mojo::Rennari::Connection->new(server => $self, id => $id);
@@ -190,6 +199,9 @@ sub websocket_route {
             rooms      => {},
             offset     => 0,
             buffered   => [],
+            conn_id    => $id,
+            offline    => 0,
+            gen        => 0,
         };
     }
 
@@ -200,7 +212,7 @@ sub websocket_route {
     $c->stash(rennari_namespace => '/');
     $conn->namespace('/');
 
-    # announce session and default namespace
+    # announce session
     if ($self->recovery) {
         $self->_send_to_connection($id, 'rennari_session', { id => $session });
     }
@@ -232,9 +244,9 @@ sub websocket_route {
             return $self->_handle_resume($c, $id, $data, $s);
         }
 
-        # --- namespace switch ---------------------------------------
+        # --- namespace join -----------------------------------------
         if ($event eq 'rennari_nsp') {
-            my $name = $data->{name} // '/';
+            my $name = (ref $data eq 'HASH' ? $data->{name} : undef) // '/';
             my $nsp  = $self->_namespaces->{$name};
             unless ($nsp) {
                 $self->_log(warn => "rennari: unknown namespace '$name'");
@@ -243,23 +255,31 @@ sub websocket_route {
             }
             $nsp->attach($id);
             $self->_connections->{$id}{namespaces}{$name} = 1;
-            $c->stash(rennari_namespace => $name);
-            $conn->namespace($name);
             $self->_send_to_connection($id, 'rennari_nsp_ok', { name => $name });
             return;
         }
 
-        my $current = $c->stash('rennari_namespace') // '/';
-        my $nsp     = $self->_namespaces->{$current} or return;
-        my $cb      = $nsp->handler_for($event);
+        # --- regular event: routed by the frame's own namespace -----
+        my $nsp_name = $frame->{n} // '/';
+        my $nsp      = $self->_namespaces->{$nsp_name};
+        unless ($nsp && $self->_connections->{$id}{namespaces}{$nsp_name}) {
+            $self->_log(warn => "rennari: frame for unjoined namespace '$nsp_name'");
+            $self->_fire(error => $c, 'unknown_namespace', $nsp_name);
+            return $c->tx->finish(4005, 'unknown namespace');
+        }
 
+        # handlers use $c->rennari, which follows the frame being handled
+        $conn->namespace($nsp_name);
+        $c->stash(rennari_namespace => $nsp_name);
+
+        my $cb = $nsp->handler_for($event);
         unless ($cb) {
             $self->_fire(error => $c, 'unknown_event', $event);
             if ($is_mock) {
                 $self->_log(debug => "rennari: mock ignoring '$event'");
                 return;
             }
-            $self->_log(warn => "rennari: unknown event '$event' in '$current'");
+            $self->_log(warn => "rennari: unknown event '$event' in '$nsp_name'");
             return $c->tx->finish(4003, 'unknown event');
         }
 
@@ -271,7 +291,7 @@ sub websocket_route {
         }
 
         if (defined $reply) {
-            $self->_send_to_connection($id, 'reply', $reply);
+            $self->_send_to_connection($id, 'reply', $reply, $nsp_name);
         }
 
         if (defined $fid) {
@@ -281,31 +301,41 @@ sub websocket_route {
 
     $c->on(finish => sub {
         $self->_log(info => "rennari: connection closed ($identity->{id})");
-        my $conn = $self->_connections->{$id};
+        my $rec = $self->_connections->{$id};
 
-        if ($conn) {
-            for my $nsp_name (keys %{ $conn->{namespaces} }) {
+        if ($rec) {
+            # capture rooms BEFORE detaching: detach clears them
+            my %rooms;
+            for my $nsp_name (keys %{ $rec->{namespaces} }) {
+                my $nsp = $self->_namespaces->{$nsp_name} or next;
+                my $r = $nsp->rooms_of($id);
+                $rooms{$nsp_name} = $r if @$r;
+            }
+
+            for my $nsp_name (keys %{ $rec->{namespaces} }) {
                 my $nsp = $self->_namespaces->{$nsp_name} or next;
                 $nsp->detach($id);
             }
 
-            # keep session alive for recovery window
-            if ($self->recovery && $conn->{session_id}) {
-                my $sess = $self->_sessions->{ $conn->{session_id} };
-                if ($sess) {
-                    $sess->{namespaces} = { %{ $conn->{namespaces} } };
-                    $sess->{rooms}      = {};
-                    for my $nsp_name (keys %{ $conn->{namespaces} }) {
-                        my $nsp = $self->_namespaces->{$nsp_name} or next;
-                        my $rooms = $nsp->rooms_of($id);
-                        $sess->{rooms}{$nsp_name} = $rooms if @$rooms;
-                    }
-                    $conn->{offline} = 1;
-                    my $sid = $conn->{session_id};
-                    Mojo::IOLoop->timer($self->recovery_window => sub {
-                        delete $self->_sessions->{$sid};
-                    });
-                }
+            my $sid  = $rec->{session_id};
+            my $sess = ($self->recovery && $sid) ? $self->_sessions->{$sid} : undef;
+
+            if ($sess) {
+                # keep the session alive for the recovery window
+                $sess->{namespaces} = { %{ $rec->{namespaces} } };
+                $sess->{rooms}      = \%rooms;
+                $sess->{conn_id}    = $id;
+                $sess->{offline}    = 1;
+                $rec->{offline}     = 1;
+                my $gen = ++$sess->{gen};
+
+                Mojo::IOLoop->timer($self->recovery_window => sub {
+                    my $cur = $self->_sessions->{$sid} or return;
+                    # a resume (or a later disconnect) bumps gen: leave it alone
+                    return unless $cur->{offline} && $cur->{gen} == $gen;
+                    delete $self->_connections->{ $cur->{conn_id} };
+                    delete $self->_sessions->{$sid};
+                });
             }
             else {
                 delete $self->_connections->{$id};
@@ -323,20 +353,30 @@ sub _handle_resume {
 
     return $c->tx->finish(4006, 'recovery disabled') unless $self->recovery;
 
+    $data = {} unless ref $data eq 'HASH';
     my $sid    = $data->{session_id} // '';
     my $offset = $data->{offset}     // -1;
+    $offset = -1 unless $offset =~ /\A-?[0-9]+\z/;
 
-    my $sess = $self->_sessions->{$sid};
-    unless ($sess) {
+    my $sess = $sid ne '' ? $self->_sessions->{$sid} : undef;
+    unless ($sess && $sess->{offline}) {
         return $self->_send_to_connection($new_id, 'rennari_resume_failed',
             { reason => 'unknown_session' });
     }
+
+    my $new = $self->_connections->{$new_id};
+
+    # drop the throwaway session created for this connection and the
+    # offline record of the connection being resumed
+    delete $self->_sessions->{ $new->{session_id} };
+    delete $self->_connections->{ $sess->{conn_id} }
+        if defined $sess->{conn_id} && $sess->{conn_id} != $new_id;
 
     # re-attach namespaces and rooms
     for my $nsp_name (keys %{ $sess->{namespaces} }) {
         my $nsp = $self->_namespaces->{$nsp_name} or next;
         $nsp->attach($new_id);
-        $self->_connections->{$new_id}{namespaces}{$nsp_name} = 1;
+        $new->{namespaces}{$nsp_name} = 1;
     }
     for my $nsp_name (keys %{ $sess->{rooms} }) {
         my $nsp = $self->_namespaces->{$nsp_name} or next;
@@ -350,13 +390,18 @@ sub _handle_resume {
         $self->_log(warn => "rennari: replay send failed: $@") if $@;
     }
 
-    # transfer session to the new connection
-    $self->_connections->{$new_id}{session_id} = $sid;
-    $self->_connections->{$new_id}{offset}     = $sess->{offset};
-    $sess->{buffered} = [];
+    # transfer the session to the new connection
+    $new->{session_id} = $sid;
+    $new->{offset}     = $sess->{offset};
+    $sess->{buffered}  = [];
+    $sess->{conn_id}   = $new_id;
+    $sess->{offline}   = 0;
+    $sess->{gen}++;    # cancels the pending expiry timer
 
+    # report the session id so the client keeps using it, not the
+    # throwaway one announced when this socket opened
     $self->_send_to_connection($new_id, 'rennari_resumed',
-        { offset => $sess->{offset} });
+        { offset => $sess->{offset}, session_id => $sid });
 
     return;
 }
@@ -368,6 +413,23 @@ __END__
 
 Mojo::Rennari::Server - WebSocket event server
 
+=head1 ATTRIBUTES
+
+=head2 inactivity_timeout
+
+Seconds of silence before a connection is closed. Default 300. Mojolicious
+itself defaults to 30, which drops idle clients.
+
+=head1 NAMESPACES
+
+Every frame may carry an C<n> field naming its namespace (default C</>).
+The server routes each incoming frame by that field, so handlers for
+C</chat> and C</> never depend on connection state. A client must first
+join a non-default namespace with C<rennari_nsp>; frames for a namespace
+it has not joined close the connection with code 4005. Handlers see the
+namespace of the frame being handled via C<< $c->rennari->namespace >>,
+and everything they send is tagged with it.
+
 =head1 RECOVERY
 
 Set C<< recovery => 1 >> to enable connection state recovery. The server
@@ -376,10 +438,13 @@ and buffers frames sent to a connection that has temporarily dropped.
 
 On reconnect, the client sends C<< { e => 'rennari_resume', d => { session_id, offset } } >>.
 If the session is still alive (within C<recovery_window> seconds, default
-120), the server replays missed frames and re-attaches namespaces and
-rooms.
+120), the server replays missed frames, re-attaches namespaces and
+rooms, and answers C<rennari_resumed> with the offset and session id. A
+session that is unknown, expired, or still attached to a live connection
+gets C<rennari_resume_failed>.
 
-Sessions expire C<recovery_window> seconds after disconnect.
+Sessions and their offline connection records are removed
+C<recovery_window> seconds after disconnect unless resumed.
 
 =head1 LICENSE
 

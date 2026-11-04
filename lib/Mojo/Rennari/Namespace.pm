@@ -2,7 +2,7 @@ package Mojo::Rennari::Namespace;
 use Mojo::Base -base;
 use Mojo::Rennari::Protocol qw(encode_frame);
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 has 'name'         => '/';
 has 'server';
@@ -74,15 +74,30 @@ sub rooms_of {
     return [sort @rooms];
 }
 
+# send one event to one member, tagged with this namespace
+sub send_to {
+    my ($self, $id, $event, $payload) = @_;
+    return 0 unless $self->_connections->{$id};
+    return $self->server->_send_to_connection(
+        $id, $event, $payload, $self->name);
+}
+
 sub broadcast_to_room {
     my ($self, $room, $event, $payload) = @_;
     my $members = $self->_rooms->{$room} or return 0;
-    my $server  = $self->server;
     my $count   = 0;
     for my $id (keys %$members) {
-        my $conn = $server->_connections->{$id} or next;
-        next unless $conn->{namespaces}{ $self->name };
-        $count++ if $server->_send_to_connection($id, $event, $payload);
+        $count++ if $self->send_to($id, $event, $payload);
+    }
+    return $count;
+}
+
+# send to every member of this namespace
+sub broadcast {
+    my ($self, $event, $payload) = @_;
+    my $count = 0;
+    for my $id (keys %{ $self->_connections }) {
+        $count++ if $self->send_to($id, $event, $payload);
     }
     return $count;
 }
@@ -103,7 +118,8 @@ Mojo::Rennari::Namespace - one namespace's handlers, rooms, and members
 
 Namespaces multiplex multiple logical channels over a single WebSocket
 connection, like Socket.IO. Each namespace has its own handlers, rooms,
-and member set.
+and member set. Every frame a namespace sends carries its name in the
+C<n> field so the client can dispatch it to the right handlers.
 
 Use the default C</> namespace via C<< $server->on(...) >>. Use named
 namespaces via C<< $server->namespace($name)->on(...) >>.

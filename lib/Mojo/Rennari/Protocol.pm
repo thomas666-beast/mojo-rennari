@@ -4,14 +4,18 @@ use Data::MessagePack;
 use Mojo::JSON qw(encode_json decode_json);
 use Exporter 'import';
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
-our @EXPORT_OK = qw(encode_frame decode_frame valid_event_name valid_id);
+our @EXPORT_OK = qw(
+    encode_frame decode_frame
+    valid_event_name valid_id valid_namespace_name
+);
 
 use constant DEFAULT_MAX_BYTES => 64 * 1024;
 use constant MAX_EVENT_LEN     => 64;
 
 my $EVENT_RE = qr/\A[A-Za-z0-9_.:-]{1,64}\z/;
+my $NSP_RE   = qr{\A/[A-Za-z0-9_.:/-]{0,63}\z};
 my $mp       = Data::MessagePack->new->utf8;
 
 sub valid_event_name {
@@ -26,6 +30,12 @@ sub valid_id {
     return $id =~ /\A[0-9]{1,20}\z/ ? 1 : 0;
 }
 
+sub valid_namespace_name {
+    my ($name) = @_;
+    return 0 unless defined $name && !ref $name;
+    return $name =~ $NSP_RE ? 1 : 0;
+}
+
 sub _check_serializer {
     my ($s) = @_;
     $s //= 'msgpack';
@@ -34,8 +44,9 @@ sub _check_serializer {
     return $s;
 }
 
+# encode_frame($event, $payload, $serializer, $id, $offset, $namespace)
 sub encode_frame {
-    my ($event, $payload, $serializer, $id, $offset) = @_;
+    my ($event, $payload, $serializer, $id, $offset, $nsp) = @_;
     die 'encode_frame: invalid event name'
         unless valid_event_name($event);
     my $s = _check_serializer($serializer);
@@ -47,6 +58,12 @@ sub encode_frame {
     if (defined $offset) {
         die 'encode_frame: invalid offset' unless $offset =~ /\A[0-9]+\z/;
         $frame->{o} = $offset + 0;
+    }
+    # the default namespace is implied and omitted from the wire
+    if (defined $nsp && $nsp ne '/') {
+        die 'encode_frame: invalid namespace'
+            unless valid_namespace_name($nsp);
+        $frame->{n} = $nsp;
     }
     return $s eq 'json' ? encode_json($frame) : $mp->pack($frame);
 }
@@ -82,6 +99,10 @@ sub decode_frame {
         $frame->{id} += 0;
     }
 
+    if (exists $frame->{n}) {
+        return undef unless valid_namespace_name($frame->{n});
+    }
+
     return $frame;
 }
 
@@ -98,6 +119,7 @@ Mojo::Rennari::Protocol - MessagePack or JSON framing with optional ids
 
   my $bytes = encode_frame('smile', { ok => 1 });              # no id
   my $bytes = encode_frame('smile', { ok => 1 }, undef, 42);   # id 42
+  my $bytes = encode_frame('hi', {}, undef, undef, undef, '/chat');
 
   my $frame = decode_frame($bytes);
   # { e => 'smile', d => { ok => 1 }, id => 42 }
@@ -106,13 +128,17 @@ Mojo::Rennari::Protocol - MessagePack or JSON framing with optional ids
 
 Wire format is a map:
 
-  { e => $event_name, d => $payload, id => $id? }
+  { e => $event_name, d => $payload, id => $id?, o => $offset?, n => $namespace? }
 
 The optional C<id> is used for acknowledgement. When a frame has an id,
 the server replies with C<< { e => 'rennari_ack', d => { id => $id } } >>
 after the handler returns successfully. If the handler dies, no ack is
 sent, and the client's retry logic (in the JavaScript client) resends
 the frame.
+
+The optional C<n> names the namespace the frame belongs to. When absent
+it is C</>. Both sides route frames by C<n>, so the namespace is never
+connection state.
 
 Duplicate delivery is possible with retries. The framework does not
 deduplicate; the application should treat retried events as idempotent
@@ -121,7 +147,8 @@ if it uses retries.
 =head1 SECURITY
 
 Ids are validated to be decimal digits only, 1 to 20 characters. No
-negative, no fraction, no string payload. Malformed ids cause the whole
-frame to be rejected.
+negative, no fraction, no string payload. Namespace names must start with
+C</> and be at most 64 characters of C<[A-Za-z0-9_.:/-]>. Malformed ids or
+namespaces cause the whole frame to be rejected.
 
 =cut
