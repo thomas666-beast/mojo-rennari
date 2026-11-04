@@ -35,7 +35,7 @@ sub _check_serializer {
 }
 
 sub encode_frame {
-    my ($event, $payload, $serializer, $id) = @_;
+    my ($event, $payload, $serializer, $id, $offset) = @_;
     die 'encode_frame: invalid event name'
         unless valid_event_name($event);
     my $s = _check_serializer($serializer);
@@ -43,6 +43,10 @@ sub encode_frame {
     if (defined $id) {
         die 'encode_frame: invalid id' unless valid_id($id);
         $frame->{id} = $id + 0;    # coerce to number
+    }
+    if (defined $offset) {
+        die 'encode_frame: invalid offset' unless $offset =~ /\A[0-9]+\z/;
+        $frame->{o} = $offset + 0;
     }
     return $s eq 'json' ? encode_json($frame) : $mp->pack($frame);
 }
@@ -62,6 +66,12 @@ sub decode_frame {
     else {
         $frame = eval { $mp->unpack($bytes) };
     }
+
+    if (exists $frame->{o}) {
+        return undef unless $frame->{o} =~ /\A[0-9]+\z/;
+        $frame->{o} += 0;
+    }
+
     return undef if $@;
     return undef unless ref $frame eq 'HASH';
     return undef unless valid_event_name($frame->{e});

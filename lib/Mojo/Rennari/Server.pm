@@ -3,6 +3,7 @@ use Mojo::Base -base;
 use Mojo::Rennari::Protocol qw(encode_frame decode_frame);
 use Mojo::Rennari::Connection;
 use Mojo::Rennari::Namespace;
+use Mojo::IOLoop;
 
 our $VERSION = '0.001';
 
@@ -16,25 +17,28 @@ our $VERSION = '0.001';
 }
 
 has 'auth_cb';
-has 'mock'         => 0;
-has 'force_mock'   => 0;
-has 'max_bytes'    => 64 * 1024;
+has 'mock'          => 0;
+has 'force_mock'    => 0;
+has 'max_bytes'     => 64 * 1024;
+has 'serializer'    => 'msgpack';
 has 'logger';
+has 'recovery'      => 0;
+has 'recovery_window' => 120;
 
 has 'on_connect_cb';
 has 'on_disconnect_cb';
 has 'on_error_cb';
 
 has '_namespaces'  => sub { {} };
-has '_connections' => sub { {} };   # id -> { tx, identity, namespaces => { nsp => 1 } }
+has '_connections' => sub { {} };
+has '_sessions'    => sub { {} };
 has '_next_id'     => 0;
-
-has 'serializer' => 'msgpack';
 
 sub namespace {
     my ($self, $name) = @_;
     $name //= '/';
-    return $self->_namespaces->{$name} //= Mojo::Rennari::Namespace->new(name => $name, server => $self);
+    return $self->_namespaces->{$name}
+        //= Mojo::Rennari::Namespace->new(name => $name, server => $self);
 }
 
 sub on {
@@ -42,26 +46,9 @@ sub on {
     return $self->namespace('/')->on(@_);
 }
 
-sub on_connect {
-    my ($self, $cb) = @_;
-    die 'on_connect: handler must be a code ref' unless ref $cb eq 'CODE';
-    $self->on_connect_cb($cb);
-    return $self;
-}
-
-sub on_disconnect {
-    my ($self, $cb) = @_;
-    die 'on_disconnect: handler must be a code ref' unless ref $cb eq 'CODE';
-    $self->on_disconnect_cb($cb);
-    return $self;
-}
-
-sub on_error {
-    my ($self, $cb) = @_;
-    die 'on_error: handler must be a code ref' unless ref $cb eq 'CODE';
-    $self->on_error_cb($cb);
-    return $self;
-}
+sub on_connect    { my ($s, $cb) = @_; die 'code ref' unless ref $cb eq 'CODE'; $s->on_connect_cb($cb);    $s }
+sub on_disconnect { my ($s, $cb) = @_; die 'code ref' unless ref $cb eq 'CODE'; $s->on_disconnect_cb($cb); $s }
+sub on_error      { my ($s, $cb) = @_; die 'code ref' unless ref $cb eq 'CODE'; $s->on_error_cb($cb);      $s }
 
 sub _mock_enabled {
     my $self = shift;
@@ -74,12 +61,8 @@ sub _mock_enabled {
 
 sub _log {
     my ($self, $level, $msg) = @_;
-    if (my $logger = $self->logger) {
-        $logger->$level($msg);
-    }
-    else {
-        warn "[rennari $level] $msg\n";
-    }
+    if (my $logger = $self->logger) { $logger->$level($msg) }
+    else { warn "[rennari $level] $msg\n" }
 }
 
 sub _fire {
@@ -88,7 +71,19 @@ sub _fire {
     return unless $cb;
     eval { $cb->(@args) };
     $self->_log(error => "on_$kind died: $@") if $@;
-    return;
+}
+
+sub _new_session_id {
+    my $self = shift;
+    my $id = '';
+    $id .= sprintf '%02x', int(rand(256)) for 1 .. 16;
+    return $id;
+}
+
+sub _session_of {
+    my ($self, $id) = @_;
+    my $conn = $self->_connections->{$id} or return undef;
+    return $conn->{session_id} ? $self->_sessions->{ $conn->{session_id} } : undef;
 }
 
 sub broadcast_to_room {
@@ -112,11 +107,34 @@ sub rooms_of {
     return [sort keys %seen];
 }
 
+# send a frame to one connection, buffering if recovery is on and the
+# connection is in the disconnected-but-recoverable state
+sub _send_to_connection {
+    my ($self, $id, $event, $payload) = @_;
+    my $conn = $self->_connections->{$id};
+    my $s    = $self->serializer;
+
+    if ($conn && $conn->{tx} && !$conn->{offline}) {
+        my $offset = ++$conn->{offset};
+        my $bytes  = encode_frame($event, $payload, $s, undef, $offset);
+        eval { $conn->{tx}->send({binary => $bytes}) };
+        $self->_log(warn => "rennari: send failed: $@") if $@;
+        return 1;
+    }
+
+    # offline: buffer if recovery
+    return 0 unless $self->recovery;
+    my $session = $self->_session_of($id) or return 0;
+    my $offset  = ++$session->{offset};
+    my $bytes   = encode_frame($event, $payload, $s, undef, $offset);
+    push @{ $session->{buffered} }, { offset => $offset, bytes => $bytes };
+    return 1;
+}
+
 sub websocket_route {
     my ($self, $c) = @_;
 
     my $mock = $self->_mock_enabled;
-    my $serializer = $self->serializer;
 
     my $identity;
     if ($mock) {
@@ -138,28 +156,48 @@ sub websocket_route {
         }
     }
 
-    my $id   = ++$self->{_next_id};
-    my $conn = Mojo::Rennari::Connection->new(
-        server => $self,
-        id     => $id,
-    );
+    my $id      = ++$self->{_next_id};
+    my $session = $self->_new_session_id;
+    my $conn    = Mojo::Rennari::Connection->new(server => $self, id => $id);
+    my $s       = $self->serializer;
 
     $c->stash(rennari_id       => $id);
+    $c->stash(rennari_session  => $session);
     $c->stash(rennari_identity => $identity);
     $c->stash(rennari          => $conn);
 
     $self->_connections->{$id} = {
         tx         => $c->tx,
         identity   => $identity,
+        session_id => $session,
         namespaces => {},
+        offset     => 0,
+        offline    => 0,
     };
 
-    # default namespace attaches on connect
+    if ($self->recovery) {
+        $self->_sessions->{$session} = {
+            id         => $session,
+            identity   => $identity,
+            namespaces => {},
+            rooms      => {},
+            offset     => 0,
+            buffered   => [],
+        };
+    }
+
+    # default namespace
     my $default = $self->namespace('/');
     $default->attach($id);
     $self->_connections->{$id}{namespaces}{'/'} = 1;
     $c->stash(rennari_namespace => '/');
     $conn->namespace('/');
+
+    # announce session and default namespace
+    my $hello = encode_frame('rennari_session',
+        { id => $session }, $s, undef, ++$self->_connections->{$id}{offset});
+    $c->send({binary => $hello});
+    $self->_sessions->{$session}{offset}++ if $self->recovery;
 
     my $max     = $self->max_bytes;
     my $is_mock = $mock;
@@ -169,12 +207,9 @@ sub websocket_route {
 
     $c->on(message => sub {
         my ($c, $bytes) = @_;
-        my $serializer = $self->serializer;
 
         my $frame = decode_frame(
-            $bytes,
-            max_bytes  => $max,
-            serializer => $serializer,
+            $bytes, max_bytes => $max, serializer => $s,
         );
         unless ($frame) {
             $self->_log(warn => "rennari: bad frame from $identity->{id}");
@@ -186,6 +221,12 @@ sub websocket_route {
         my $data  = $frame->{d};
         my $fid   = $frame->{id};
 
+        # --- resume -------------------------------------------------
+        if ($event eq 'rennari_resume') {
+            return $self->_handle_resume($c, $id, $data, $s);
+        }
+
+        # --- namespace switch ---------------------------------------
         if ($event eq 'rennari_nsp') {
             my $name = $data->{name} // '/';
             my $nsp  = $self->_namespaces->{$name};
@@ -198,10 +239,7 @@ sub websocket_route {
             $self->_connections->{$id}{namespaces}{$name} = 1;
             $c->stash(rennari_namespace => $name);
             $conn->namespace($name);
-            $c->send({
-                binary => encode_frame('rennari_nsp_ok',
-                    { name => $name }, $serializer),
-            });
+            $self->_send_to_connection($id, 'rennari_nsp_ok', { name => $name });
             return;
         }
 
@@ -227,39 +265,97 @@ sub websocket_route {
         }
 
         if (defined $reply) {
-            eval {
-                $c->send({
-                    binary => encode_frame('reply', $reply, $serializer),
-                });
-            };
-            $self->_log(error => "rennari: send failed: $@") if $@;
+            $self->_send_to_connection($id, 'reply', $reply);
         }
 
         if (defined $fid) {
-            eval {
-                $c->send({
-                    binary => encode_frame('rennari_ack',
-                        { id => $fid }, $serializer),
-                });
-            };
-            $self->_log(error => "rennari: ack send failed: $@") if $@;
+            $self->_send_to_connection($id, 'rennari_ack', { id => $fid });
         }
     });
 
     $c->on(finish => sub {
         $self->_log(info => "rennari: connection closed ($identity->{id})");
         my $conn = $self->_connections->{$id};
+
         if ($conn) {
             for my $nsp_name (keys %{ $conn->{namespaces} }) {
                 my $nsp = $self->_namespaces->{$nsp_name} or next;
                 $nsp->detach($id);
             }
+
+            # keep session alive for recovery window
+            if ($self->recovery && $conn->{session_id}) {
+                my $sess = $self->_sessions->{ $conn->{session_id} };
+                if ($sess) {
+                    $sess->{namespaces} = { %{ $conn->{namespaces} } };
+                    $sess->{rooms}      = {};
+                    for my $nsp_name (keys %{ $conn->{namespaces} }) {
+                        my $nsp = $self->_namespaces->{$nsp_name} or next;
+                        my $rooms = $nsp->rooms_of($id);
+                        $sess->{rooms}{$nsp_name} = $rooms if @$rooms;
+                    }
+                    $conn->{offline} = 1;
+                    my $sid = $conn->{session_id};
+                    Mojo::IOLoop->timer($self->recovery_window => sub {
+                        delete $self->_sessions->{$sid};
+                    });
+                }
+            }
+            else {
+                delete $self->_connections->{$id};
+            }
         }
-        delete $self->_connections->{$id};
+
         $self->_fire(disconnect => $c, $identity);
     });
 
     return undef;
+}
+
+sub _handle_resume {
+    my ($self, $c, $new_id, $data, $s) = @_;
+
+    return $c->tx->finish(4006, 'recovery disabled') unless $self->recovery;
+
+    my $sid    = $data->{session_id} // '';
+    my $offset = $data->{offset}     // -1;
+
+    my $sess = $self->_sessions->{$sid};
+    unless ($sess) {
+        return $self->_send_to_connection($new_id, 'rennari_resume_failed',
+            { reason => 'unknown_session' });
+    }
+
+    # re-attach namespaces and rooms
+    for my $nsp_name (keys %{ $sess->{namespaces} }) {
+        my $nsp = $self->_namespaces->{$nsp_name} or next;
+        $nsp->attach($new_id);
+        $self->_connections->{$new_id}{namespaces}{$nsp_name} = 1;
+    }
+    for my $nsp_name (keys %{ $sess->{rooms} }) {
+        my $nsp = $self->_namespaces->{$nsp_name} or next;
+        $nsp->join($new_id, $_) for @{ $sess->{rooms}{$nsp_name} };
+    }
+
+    # replay buffered frames past the client's offset
+    my @replay = grep { $_->{offset} > $offset } @{ $sess->{buffered} };
+    for my $entry (@replay) {
+        eval { $c->send({binary => $entry->{bytes}}) };
+        $self->_log(warn => "rennari: replay send failed: $@") if $@;
+    }
+
+    # transfer session to the new connection
+    $self->_connections->{$new_id}{session_id} = $sid;
+    $self->_connections->{$new_id}{offset}     = $sess->{offset};
+    $sess->{buffered} = [];
+
+    my $old_id = $sess->{id};
+    delete $self->_connections->{$old_id} if $old_id && $old_id != $new_id;
+
+    $self->_send_to_connection($new_id, 'rennari_resumed',
+        { offset => $sess->{offset} });
+
+    return;
 }
 
 1;
@@ -267,36 +363,20 @@ __END__
 
 =head1 NAME
 
-Mojo::Rennari::Server - WebSocket event server for Mojolicious
+Mojo::Rennari::Server - WebSocket event server
 
-=head1 SYNOPSIS
+=head1 RECOVERY
 
-  my $rennari = Mojo::Rennari::Server->new(auth_cb => sub { ... });
+Set C<< recovery => 1 >> to enable connection state recovery. The server
+issues a private session id, tracks an offset on every outbound frame,
+and buffers frames sent to a connection that has temporarily dropped.
 
-  # default namespace
-  $rennari->on('smile' => sub { ... });
+On reconnect, the client sends C<< { e => 'rennari_resume', d => { session_id, offset } } >>.
+If the session is still alive (within C<recovery_window> seconds, default
+120), the server replays missed frames and re-attaches namespaces and
+rooms.
 
-  # named namespace
-  $rennari->namespace('/chat')->on('message' => sub {
-      my ($c, $payload) = @_;
-      $c->rennari->broadcast_to_room('lobby', 'chat', $payload);
-  });
-
-  websocket '/ws' => sub { $rennari->websocket_route(shift) };
-
-=head1 NAMESPACES
-
-Multiple logical channels multiplexed over one WebSocket connection,
-like Socket.IO. The default namespace is C</>. Register more with
-C<< $server->namespace($name) >>.
-
-The client declares its namespace with a first frame
-C<< { e => 'rennari_nsp', d => { name => '/chat' } } >>. The server
-replies C<< { e => 'rennari_nsp_ok', d => { name => '/chat' } } >>.
-If the client never sends one, it is on C</>.
-
-Rooms are per-namespace. A room named C<lobby> in C</chat> is not the
-same as C<lobby> in C</>.
+Sessions expire C<recovery_window> seconds after disconnect.
 
 =head1 LICENSE
 
