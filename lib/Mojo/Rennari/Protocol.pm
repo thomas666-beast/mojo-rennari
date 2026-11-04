@@ -6,7 +6,7 @@ use Exporter 'import';
 
 our $VERSION = '0.001';
 
-our @EXPORT_OK = qw(encode_frame decode_frame valid_event_name);
+our @EXPORT_OK = qw(encode_frame decode_frame valid_event_name valid_id);
 
 use constant DEFAULT_MAX_BYTES => 64 * 1024;
 use constant MAX_EVENT_LEN     => 64;
@@ -20,6 +20,12 @@ sub valid_event_name {
     return $name =~ $EVENT_RE ? 1 : 0;
 }
 
+sub valid_id {
+    my ($id) = @_;
+    return 0 if !defined $id || ref $id;
+    return $id =~ /\A[0-9]{1,20}\z/ ? 1 : 0;
+}
+
 sub _check_serializer {
     my ($s) = @_;
     $s //= 'msgpack';
@@ -29,11 +35,15 @@ sub _check_serializer {
 }
 
 sub encode_frame {
-    my ($event, $payload, $serializer) = @_;
+    my ($event, $payload, $serializer, $id) = @_;
     die 'encode_frame: invalid event name'
         unless valid_event_name($event);
     my $s = _check_serializer($serializer);
     my $frame = { e => $event, d => $payload };
+    if (defined $id) {
+        die 'encode_frame: invalid id' unless valid_id($id);
+        $frame->{id} = $id + 0;    # coerce to number
+    }
     return $s eq 'json' ? encode_json($frame) : $mp->pack($frame);
 }
 
@@ -56,6 +66,12 @@ sub decode_frame {
     return undef unless ref $frame eq 'HASH';
     return undef unless valid_event_name($frame->{e});
     return undef unless exists $frame->{d};
+
+    if (exists $frame->{id}) {
+        return undef unless valid_id($frame->{id});
+        $frame->{id} += 0;
+    }
+
     return $frame;
 }
 
@@ -64,37 +80,38 @@ __END__
 
 =head1 NAME
 
-Mojo::Rennari::Protocol - MessagePack or JSON framing
+Mojo::Rennari::Protocol - MessagePack or JSON framing with optional ids
 
 =head1 SYNOPSIS
 
   use Mojo::Rennari::Protocol qw(encode_frame decode_frame);
 
-  my $bytes = encode_frame('smile', { ok => 1 });           # msgpack (default)
-  my $bytes = encode_frame('smile', { ok => 1 }, 'json');   # json
+  my $bytes = encode_frame('smile', { ok => 1 });              # no id
+  my $bytes = encode_frame('smile', { ok => 1 }, undef, 42);   # id 42
 
-  my $frame = decode_frame($bytes);                          # msgpack
-  my $frame = decode_frame($bytes, serializer => 'json');    # json
+  my $frame = decode_frame($bytes);
+  # { e => 'smile', d => { ok => 1 }, id => 42 }
 
 =head1 DESCRIPTION
 
-Wire format is a single map:
+Wire format is a map:
 
-  { e => $event_name, d => $payload }
+  { e => $event_name, d => $payload, id => $id? }
 
-The serializer is chosen per call. C<msgpack> is the default; C<json>
-is available for environments where MessagePack is inconvenient.
-MessagePack is better for binary payloads; JSON only handles text and
-numbers cleanly.
+The optional C<id> is used for acknowledgement. When a frame has an id,
+the server replies with C<< { e => 'rennari_ack', d => { id => $id } } >>
+after the handler returns successfully. If the handler dies, no ack is
+sent, and the client's retry logic (in the JavaScript client) resends
+the frame.
 
-Decoding is defensive. Malformed input, wrong shape, invalid event name,
-or frames larger than C<max_bytes> (default 64 KiB) return C<undef>.
-C<decode_frame> never dies on untrusted input.
+Duplicate delivery is possible with retries. The framework does not
+deduplicate; the application should treat retried events as idempotent
+if it uses retries.
 
-The serializer is a per-server choice, not a per-connection one. A
-server started with C<serializer =E<gt> 'msgpack'> only parses
-MessagePack; a server with C<serializer =E<gt> 'json'> only parses
-JSON. Mismatched frames fail to decode, same as any other malformed
-input.
+=head1 SECURITY
+
+Ids are validated to be decimal digits only, 1 to 20 characters. No
+negative, no fraction, no string payload. Malformed ids cause the whole
+frame to be rejected.
 
 =cut

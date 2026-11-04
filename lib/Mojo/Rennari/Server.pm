@@ -169,8 +169,13 @@ sub websocket_route {
 
     $c->on(message => sub {
         my ($c, $bytes) = @_;
+        my $serializer = $self->serializer;
 
-        my $frame = decode_frame($bytes, max_bytes => $max, serializer => $serializer);
+        my $frame = decode_frame(
+            $bytes,
+            max_bytes  => $max,
+            serializer => $serializer,
+        );
         unless ($frame) {
             $self->_log(warn => "rennari: bad frame from $identity->{id}");
             $self->_fire(error => $c, 'bad_frame', undef);
@@ -179,8 +184,8 @@ sub websocket_route {
 
         my $event = $frame->{e};
         my $data  = $frame->{d};
+        my $fid   = $frame->{id};
 
-        # namespace switch (built-in)
         if ($event eq 'rennari_nsp') {
             my $name = $data->{name} // '/';
             my $nsp  = $self->_namespaces->{$name};
@@ -193,7 +198,10 @@ sub websocket_route {
             $self->_connections->{$id}{namespaces}{$name} = 1;
             $c->stash(rennari_namespace => $name);
             $conn->namespace($name);
-            $c->send({binary => encode_frame('rennari_nsp_ok', { name => $name }, $serializer)});
+            $c->send({
+                binary => encode_frame('rennari_nsp_ok',
+                    { name => $name }, $serializer),
+            });
             return;
         }
 
@@ -219,8 +227,22 @@ sub websocket_route {
         }
 
         if (defined $reply) {
-            eval { $c->send({binary => encode_frame('reply', $reply, $serializer)}) };
+            eval {
+                $c->send({
+                    binary => encode_frame('reply', $reply, $serializer),
+                });
+            };
             $self->_log(error => "rennari: send failed: $@") if $@;
+        }
+
+        if (defined $fid) {
+            eval {
+                $c->send({
+                    binary => encode_frame('rennari_ack',
+                        { id => $fid }, $serializer),
+                });
+            };
+            $self->_log(error => "rennari: ack send failed: $@") if $@;
         }
     });
 
