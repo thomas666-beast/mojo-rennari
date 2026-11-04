@@ -77,15 +77,12 @@ sub rooms_of {
 sub broadcast_to_room {
     my ($self, $room, $event, $payload) = @_;
     my $members = $self->_rooms->{$room} or return 0;
-    my $bytes   = encode_frame($event, $payload, $self->server->serializer);
     my $server  = $self->server;
     my $count   = 0;
     for my $id (keys %$members) {
         my $conn = $server->_connections->{$id} or next;
         next unless $conn->{namespaces}{ $self->name };
-        eval { $conn->{tx}->send({binary => $bytes}) };
-        $server->_log(warn => "rennari: broadcast send failed: $@") if $@;
-        $count++;
+        $count++ if $server->_send_to_connection($id, $event, $payload);
     }
     return $count;
 }

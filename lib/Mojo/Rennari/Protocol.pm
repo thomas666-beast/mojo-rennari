@@ -66,16 +66,16 @@ sub decode_frame {
     else {
         $frame = eval { $mp->unpack($bytes) };
     }
+    return undef if $@;
+
+    return undef unless ref $frame eq 'HASH';
+    return undef unless valid_event_name($frame->{e});
+    return undef unless exists $frame->{d};
 
     if (exists $frame->{o}) {
         return undef unless $frame->{o} =~ /\A[0-9]+\z/;
         $frame->{o} += 0;
     }
-
-    return undef if $@;
-    return undef unless ref $frame eq 'HASH';
-    return undef unless valid_event_name($frame->{e});
-    return undef unless exists $frame->{d};
 
     if (exists $frame->{id}) {
         return undef unless valid_id($frame->{id});

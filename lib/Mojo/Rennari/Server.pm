@@ -115,8 +115,14 @@ sub _send_to_connection {
     my $s    = $self->serializer;
 
     if ($conn && $conn->{tx} && !$conn->{offline}) {
-        my $offset = ++$conn->{offset};
-        my $bytes  = encode_frame($event, $payload, $s, undef, $offset);
+        my $next_offset;
+        if ($self->recovery) {
+            $next_offset = ++$conn->{offset};
+            if ($conn->{session_id} && (my $sess = $self->_sessions->{ $conn->{session_id} })) {
+                $sess->{offset} = $next_offset;
+            }
+        }
+        my $bytes = encode_frame($event, $payload, $s, undef, $next_offset);
         eval { $conn->{tx}->send({binary => $bytes}) };
         $self->_log(warn => "rennari: send failed: $@") if $@;
         return 1;
@@ -127,6 +133,7 @@ sub _send_to_connection {
     my $session = $self->_session_of($id) or return 0;
     my $offset  = ++$session->{offset};
     my $bytes   = encode_frame($event, $payload, $s, undef, $offset);
+    my $offset  = ++$session->{offset};
     push @{ $session->{buffered} }, { offset => $offset, bytes => $bytes };
     return 1;
 }
@@ -194,10 +201,9 @@ sub websocket_route {
     $conn->namespace('/');
 
     # announce session and default namespace
-    my $hello = encode_frame('rennari_session',
-        { id => $session }, $s, undef, ++$self->_connections->{$id}{offset});
-    $c->send({binary => $hello});
-    $self->_sessions->{$session}{offset}++ if $self->recovery;
+    if ($self->recovery) {
+        $self->_send_to_connection($id, 'rennari_session', { id => $session });
+    }
 
     my $max     = $self->max_bytes;
     my $is_mock = $mock;
@@ -348,9 +354,6 @@ sub _handle_resume {
     $self->_connections->{$new_id}{session_id} = $sid;
     $self->_connections->{$new_id}{offset}     = $sess->{offset};
     $sess->{buffered} = [];
-
-    my $old_id = $sess->{id};
-    delete $self->_connections->{$old_id} if $old_id && $old_id != $new_id;
 
     $self->_send_to_connection($new_id, 'rennari_resumed',
         { offset => $sess->{offset} });

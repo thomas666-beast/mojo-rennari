@@ -1,6 +1,5 @@
 package Mojo::Rennari::Connection;
 use Mojo::Base -base;
-use Mojo::Rennari::Protocol qw(encode_frame);
 
 our $VERSION = '0.001';
 
@@ -38,29 +37,19 @@ sub rooms {
 
 sub send_to_self {
     my ($self, $event, $payload) = @_;
-    my $conn = $self->server->_connections->{ $self->id } or return 0;
-    eval { $conn->{tx}->send({binary => encode_frame($event, $payload, $self->server->serializer)}) };
-    $self->server->_log(warn => "rennari: send_to_self failed: $@") if $@;
-    return $@ ? 0 : 1;
+    return $self->server->_send_to_connection($self->id, $event, $payload);
 }
 
 sub send_to {
     my ($self, $id, $event, $payload) = @_;
-    my $conn = $self->server->_connections->{$id} or return 0;
-    eval { $conn->{tx}->send({binary => encode_frame($event, $payload, $self->server->serializer)}) };
-    $self->server->_log(warn => "rennari: send_to failed: $@") if $@;
-    return $@ ? 0 : 1;
+    return $self->server->_send_to_connection($id, $event, $payload);
 }
 
 sub broadcast {
     my ($self, $event, $payload) = @_;
-    my $bytes = encode_frame($event, $payload, $self->server->serializer);
     my $count = 0;
     for my $id (keys %{ $self->server->_connections }) {
-        my $conn = $self->server->_connections->{$id} or next;
-        eval { $conn->{tx}->send({binary => $bytes}) };
-        $self->server->_log(warn => "rennari: broadcast failed: $@") if $@;
-        $count++ unless $@;
+        $count++ if $self->server->_send_to_connection($id, $event, $payload);
     }
     return $count;
 }
@@ -75,7 +64,9 @@ Mojo::Rennari::Connection - per-connection helper
 =head1 DESCRIPTION
 
 Returned by C<< $c->rennari >>. All room methods operate within the
-connection's current namespace. See L<Mojo::Rennari::Server>.
+connection's current namespace. Send methods route through the server's
+C<_send_to_connection>, which handles offline buffering when recovery
+is on.
 
 =head1 LICENSE
 

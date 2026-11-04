@@ -22,15 +22,26 @@ $daemon->start;
 my $port = $daemon->ports->[0];
 my $url  = "ws://127.0.0.1:$port/ws";
 
-my $wait = sub {
-    my $n = shift;
-    Mojo::IOLoop->timer($n => sub { Mojo::IOLoop->stop });
-};
+# Wait for a frame matching a predicate, up to $timeout seconds.
+sub await_frame {
+    my ($frames_ref, $pred, $timeout) = @_;
+    $timeout //= 2;
+    my $deadline = time + $timeout;
+    while (time < $deadline) {
+        for my $f (@$frames_ref) {
+            return $f if $pred->($f);
+        }
+        Mojo::IOLoop->one_tick;
+        select undef, undef, undef, 0.02;
+    }
+    return undef;
+}
 
 my $ua = Mojo::UserAgent->new;
-my ($tx, @frames, $session_id, $last_offset);
+my ($tx, @frames);
+
 my $connect = sub {
-    my ($resume) = @_;
+    my ($resume_data) = @_;
     $ua->websocket($url => sub {
         my ($ua, $t) = @_;
         return Mojo::IOLoop->stop unless $t->is_websocket;
@@ -38,55 +49,53 @@ my $connect = sub {
         $tx->on(message => sub {
             my ($tx, $bytes) = @_;
             my $f = decode_frame($bytes);
-            push @frames, $f;
-            $last_offset = $f->{o} if defined $f->{o};
-            if ($f->{e} eq 'rennari_session') {
-                $session_id = $f->{d}{id};
-            }
+            push @frames, $f if $f;
         });
-        if ($resume) {
-            $tx->send({binary => encode_frame('rennari_resume',
-                { session_id => $session_id, offset => $last_offset })});
+        if ($resume_data) {
+            $tx->send({binary => encode_frame('rennari_resume', $resume_data)});
         }
         Mojo::IOLoop->stop;
     });
     Mojo::IOLoop->start;
 };
 
-# --- connect, get session -------------------------------------------
-$connect->(0);
+$connect->();
 ok $tx, 'connected';
-ok $session_id, 'session id received';
+
+my $sess = await_frame(\@frames, sub { $_[0]{e} eq 'rennari_session' });
+ok $sess, 'session id received';
+my $session_id = $sess->{d}{id};
+my $last_offset = $sess->{o};
 ok defined $last_offset, 'initial offset received';
 
-# --- send a frame so there is an offset to track --------------------
+# --- echo -----------------------------------------------------------------
+@frames = ();
 $tx->send({binary => encode_frame('echo', { n => 1 })});
-$wait->(0.3); Mojo::IOLoop->start;
-
-my ($back) = grep { $_->{e} eq 'echo_back' } @frames;
+my $back = await_frame(\@frames, sub { $_[0]{e} eq 'echo_back' });
 ok $back, 'echo_back received';
 ok defined $back->{o}, 'outbound frame carries offset';
 
-# --- disconnect and reconnect with resume ---------------------------
-my $saved_offset = $last_offset;
+my $saved_offset = $back->{o};
+
+# --- disconnect, resume ---------------------------------------------------
 $tx->finish;
-$wait->(0.2); Mojo::IOLoop->start;
+Mojo::IOLoop->one_tick;
+select undef, undef, undef, 0.1;
 
-$connect->(1);
-$wait->(0.3); Mojo::IOLoop->start;
-
-my ($resumed) = grep { $_->{e} eq 'rennari_resumed' } @frames;
+@frames = ();
+$connect->({ session_id => $session_id, offset => $saved_offset });
+my $resumed = await_frame(\@frames, sub { $_[0]{e} eq 'rennari_resumed' });
 ok $resumed, 'resume succeeded';
 is $resumed->{d}{offset}, $saved_offset, 'server offset matches client last';
 
-# --- unknown session fails resume -----------------------------------
-@frames = ();
-$session_id = 'deadbeef' x 4;
-$last_offset = 0;
-$connect->(1);
-$wait->(0.3); Mojo::IOLoop->start;
+# --- unknown session ------------------------------------------------------
+$tx->finish;
+Mojo::IOLoop->one_tick;
+select undef, undef, undef, 0.1;
 
-my ($failed) = grep { $_->{e} eq 'rennari_resume_failed' } @frames;
+@frames = ();
+$connect->({ session_id => 'deadbeef' x 4, offset => 0 });
+my $failed = await_frame(\@frames, sub { $_[0]{e} eq 'rennari_resume_failed' });
 ok $failed, 'unknown session resume fails';
 is $failed->{d}{reason}, 'unknown_session', 'reason is unknown_session';
 
