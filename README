@@ -1,0 +1,221 @@
+Rennari Client JS
+=================
+
+JavaScript client for Mojo::Rennari, a small MessagePack/JSON WebSocket
+event framework for Mojolicious.
+
+Wire-compatible with the Perl server. Works in Node 18+ and any modern
+browser. No build step required.
+
+STATUS
+
+Working. The Perl server and this client are tested against each other.
+See mojo-rennari for the server.
+
+INSTALL
+
+    npm install rennari-client-js
+
+Or clone and import directly from src.
+
+QUICK START
+
+    import { Rennari } from 'rennari-client-js';
+
+    const client = new Rennari('wss://example.com/ws?token=secret');
+
+    client.on('connect', () => {
+        console.log('connected, session', client.sessionId);
+        client.emit('chat', { room: 'lobby', text: 'hi' });
+    });
+
+    client.on('chat', (payload) => {
+        console.log(payload.text);
+    });
+
+    client.on('disconnect', ({ code, reason }) => {
+        console.log('disconnected', code, reason);
+    });
+
+    client.on('ack_timeout', ({ event, payload }) => {
+        console.warn('no ack for', event);
+    });
+
+    await client.connect();
+
+CORE CONCEPTS
+
+Frames
+
+Every message is a map:
+
+    { e, d, id?, o?, n? }
+
+- e - event name
+- d - payload
+- id - optional acknowledgement id
+- o - optional offset, present when the server has recovery enabled
+- n - optional namespace, omitted for /
+
+The client uses the same wire format as the Perl server. If the server
+is configured with serializer: 'json', the client must be too:
+
+    const client = new Rennari(url, { serializer: 'json' });
+
+Events
+
+    client.on(event, handler);
+    client.off(event, handler);
+    client.emit(event, payload);
+
+Client-level events (on the default / namespace) are also the place where
+local lifecycle events fire:
+
+    client.on('connect', () => {});
+    client.on('disconnect', ({ code, reason }) => {});
+    client.on('error', (err) => {});
+    client.on('ack_timeout', ({ event, payload }) => {});
+    client.on('reconnect_attempt', ({ attempt, delay }) => {});
+    client.on('reconnect_failed', () => {});
+    client.on('recovered', ({ offset }) => {});
+
+Namespaces
+
+    const chat = client.of('/chat');
+
+    chat.on('message', (payload) => {});
+    chat.emit('message', { text: 'hi' });
+
+Every non-default namespace is declared to the server on connect and on
+reconnect. Incoming frames are dispatched by their n field, not by any
+connection state. A frame for a namespace the client has not joined on
+the server side causes a close with code 4005.
+
+Acknowledgements
+
+    const ack = await client.emitWithAck('chat', { text: 'hi' }, {
+        timeout: 3000,
+        retries: 2,
+    });
+
+The client assigns an id, sends the frame, and waits for rennari_ack.
+If no ack arrives within timeout milliseconds, the frame is resent up to
+retries times. When retries are exhausted, the promise rejects and the
+ack_timeout local event fires.
+
+Duplicate delivery is possible by design: retries resend the same frame
+with the same id. Handlers on the server should be idempotent if the
+application uses retries.
+
+Reconnection
+
+On by default:
+
+    const client = new Rennari(url, {
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+        reconnectionAttempts: Infinity,
+        reconnectionJitter: 0.5,
+    });
+
+When the WebSocket closes unexpectedly, the client reconnects with
+exponential backoff plus jitter. Before each attempt, reconnect_attempt
+fires. When attempts are exhausted, reconnect_failed fires. On successful
+reconnect, connect fires again.
+
+While disconnected, emit() queues the frame in an outbox. The queue is
+flushed on the next connect. If reconnection is off, emit() throws when
+not connected.
+
+Recovery
+
+When the server has recovery enabled, it issues a session id at
+handshake. The client stores it as client.sessionId and tracks the
+server's offset as client.lastOffset.
+
+If the connection drops and reconnects within the server's recovery
+window (default 120 seconds), the client sends rennari_resume with the
+session id and last offset. The server replays missed frames, re-attaches
+namespaces and rooms, and replies rennari_resumed with the transferred
+session id. The client then fires the recovered local event.
+
+If the session has expired on the server, the server replies
+rennari_resume_failed, the client clears its session state, and connects
+fresh.
+
+    const client = new Rennari(url, {
+        recovery: true,
+        recoveryWindow: 120000,
+    });
+
+Both recovery and reconnection must be enabled for session recovery to
+work. Without reconnection, the client never tries to resume.
+
+DISCONNECT
+
+    client.disconnect();                  // 1000, 'client_disconnect'
+    client.disconnect(4000, 'user_exit'); // custom
+
+Intentional disconnect does not trigger reconnection.
+
+CONFIGURATION
+
+    new Rennari(url, {
+        serializer: 'msgpack',          // or 'json'
+        maxBytes: 64 * 1024,            // max incoming frame size
+        ackTimeout: 5000,               // ms, default per emitWithAck
+        retries: 3,                     // default per emitWithAck
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+        reconnectionAttempts: Infinity,
+        reconnectionJitter: 0.5,
+        recovery: true,
+        recoveryWindow: 120000,
+    });
+
+NODE VERSUS BROWSER
+
+In the browser, globalThis.WebSocket exists. In Node 18 and 20, it does
+not, so the ws package must be provided:
+
+    import { WebSocket } from 'ws';
+    import { setWebSocket, Rennari } from 'rennari-client-js';
+    setWebSocket(WebSocket);
+
+Node 22+ has a built-in WebSocket and does not need the ws package.
+
+In both environments, binary WebSocket frames are used. binaryType is set
+to 'arraybuffer' by the transport.
+
+CLOSE CODES
+
+The server closes with:
+
+- 4002 - bad frame
+- 4003 - unknown event
+- 4004 - handler error
+- 4005 - unknown namespace
+- 4006 - recovery disabled but client sent rennari_resume
+
+These arrive in the disconnect local event as { code, reason }.
+
+EXAMPLES
+
+A Node smoke test is in examples/node.mjs. It connects to a running Perl
+server, exercises custom events, namespaces, acks, and recovery across a
+forced disconnect.
+
+    node examples/node.mjs <port>
+
+Integration tests in tests/integration.test.js do the same thing
+programmatically against a server spawned from the Perl repo:
+
+    RENNARI_PERL_DIR=/path/to/mojo-rennari npm test
+
+Tests are skipped if RENNARI_PERL_DIR is unset.
+
+LICENSE
+
+MIT.
