@@ -77,7 +77,7 @@ sub rooms_of {
 sub broadcast_to_room {
     my ($self, $room, $event, $payload) = @_;
     my $members = $self->_rooms->{$room} or return 0;
-    my $bytes   = encode_frame($event, $payload);
+    my $bytes   = encode_frame($event, $payload, $self->server->serializer);
     my $server  = $self->server;
     my $count   = 0;
     for my $id (keys %$members) {

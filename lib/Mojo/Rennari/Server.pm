@@ -29,11 +29,12 @@ has '_namespaces'  => sub { {} };
 has '_connections' => sub { {} };   # id -> { tx, identity, namespaces => { nsp => 1 } }
 has '_next_id'     => 0;
 
+has 'serializer' => 'msgpack';
+
 sub namespace {
     my ($self, $name) = @_;
     $name //= '/';
-    return $self->_namespaces->{$name}
-        //= Mojo::Rennari::Namespace->new(name => $name, server => $self);
+    return $self->_namespaces->{$name} //= Mojo::Rennari::Namespace->new(name => $name, server => $self);
 }
 
 sub on {
@@ -115,6 +116,7 @@ sub websocket_route {
     my ($self, $c) = @_;
 
     my $mock = $self->_mock_enabled;
+    my $serializer = $self->serializer;
 
     my $identity;
     if ($mock) {
@@ -168,7 +170,7 @@ sub websocket_route {
     $c->on(message => sub {
         my ($c, $bytes) = @_;
 
-        my $frame = decode_frame($bytes, max_bytes => $max);
+        my $frame = decode_frame($bytes, max_bytes => $max, serializer => $serializer);
         unless ($frame) {
             $self->_log(warn => "rennari: bad frame from $identity->{id}");
             $self->_fire(error => $c, 'bad_frame', undef);
@@ -191,7 +193,7 @@ sub websocket_route {
             $self->_connections->{$id}{namespaces}{$name} = 1;
             $c->stash(rennari_namespace => $name);
             $conn->namespace($name);
-            $c->send({binary => encode_frame('rennari_nsp_ok', { name => $name })});
+            $c->send({binary => encode_frame('rennari_nsp_ok', { name => $name }, $serializer)});
             return;
         }
 
@@ -217,7 +219,7 @@ sub websocket_route {
         }
 
         if (defined $reply) {
-            eval { $c->send({binary => encode_frame('reply', $reply)}) };
+            eval { $c->send({binary => encode_frame('reply', $reply, $serializer)}) };
             $self->_log(error => "rennari: send failed: $@") if $@;
         }
     });

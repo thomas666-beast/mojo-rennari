@@ -39,7 +39,7 @@ sub rooms {
 sub send_to_self {
     my ($self, $event, $payload) = @_;
     my $conn = $self->server->_connections->{ $self->id } or return 0;
-    eval { $conn->{tx}->send({binary => encode_frame($event, $payload)}) };
+    eval { $conn->{tx}->send({binary => encode_frame($event, $payload, $self->server->serializer)}) };
     $self->server->_log(warn => "rennari: send_to_self failed: $@") if $@;
     return $@ ? 0 : 1;
 }
@@ -47,14 +47,14 @@ sub send_to_self {
 sub send_to {
     my ($self, $id, $event, $payload) = @_;
     my $conn = $self->server->_connections->{$id} or return 0;
-    eval { $conn->{tx}->send({binary => encode_frame($event, $payload)}) };
+    eval { $conn->{tx}->send({binary => encode_frame($event, $payload, $self->server->serializer)}) };
     $self->server->_log(warn => "rennari: send_to failed: $@") if $@;
     return $@ ? 0 : 1;
 }
 
 sub broadcast {
     my ($self, $event, $payload) = @_;
-    my $bytes = encode_frame($event, $payload);
+    my $bytes = encode_frame($event, $payload, $self->server->serializer);
     my $count = 0;
     for my $id (keys %{ $self->server->_connections }) {
         my $conn = $self->server->_connections->{$id} or next;

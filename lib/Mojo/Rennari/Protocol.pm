@@ -1,22 +1,18 @@
 package Mojo::Rennari::Protocol;
 use Mojo::Base -strict;
 use Data::MessagePack;
+use Mojo::JSON qw(encode_json decode_json);
 use Exporter 'import';
 
 our $VERSION = '0.001';
 
 our @EXPORT_OK = qw(encode_frame decode_frame valid_event_name);
 
-# 64 KiB default. A real-time event frame should be tiny; anything
-# larger is almost certainly a bug or an attack.
 use constant DEFAULT_MAX_BYTES => 64 * 1024;
+use constant MAX_EVENT_LEN     => 64;
 
-# Event names: 1..64 chars, [A-Za-z0-9_.:-]. Deliberately narrow so
-# names are safe in logs, URLs, and handler dispatch tables.
-use constant MAX_EVENT_LEN => 64;
 my $EVENT_RE = qr/\A[A-Za-z0-9_.:-]{1,64}\z/;
-
-my $mp = Data::MessagePack->new->utf8;
+my $mp       = Data::MessagePack->new->utf8;
 
 sub valid_event_name {
     my ($name) = @_;
@@ -24,26 +20,42 @@ sub valid_event_name {
     return $name =~ $EVENT_RE ? 1 : 0;
 }
 
+sub _check_serializer {
+    my ($s) = @_;
+    $s //= 'msgpack';
+    die "unsupported serializer '$s'"
+        unless $s eq 'msgpack' || $s eq 'json';
+    return $s;
+}
+
 sub encode_frame {
-    my ($event, $payload) = @_;
+    my ($event, $payload, $serializer) = @_;
     die 'encode_frame: invalid event name'
         unless valid_event_name($event);
-    return $mp->pack({ e => $event, d => $payload });
+    my $s = _check_serializer($serializer);
+    my $frame = { e => $event, d => $payload };
+    return $s eq 'json' ? encode_json($frame) : $mp->pack($frame);
 }
 
 sub decode_frame {
     my ($bytes, %opts) = @_;
     return undef unless defined $bytes && !ref $bytes && length $bytes;
 
-    my $max = $opts{max_bytes} // DEFAULT_MAX_BYTES;
+    my $serializer = _check_serializer($opts{serializer});
+    my $max        = $opts{max_bytes} // DEFAULT_MAX_BYTES;
     return undef if length($bytes) > $max;
 
-    my $frame = eval { $mp->unpack($bytes) };
+    my $frame;
+    if ($serializer eq 'json') {
+        $frame = eval { decode_json($bytes) };
+    }
+    else {
+        $frame = eval { $mp->unpack($bytes) };
+    }
     return undef if $@;
     return undef unless ref $frame eq 'HASH';
     return undef unless valid_event_name($frame->{e});
     return undef unless exists $frame->{d};
-
     return $frame;
 }
 
@@ -52,49 +64,37 @@ __END__
 
 =head1 NAME
 
-Mojo::Rennari::Protocol - MessagePack framing for Mojo::Rennari
+Mojo::Rennari::Protocol - MessagePack or JSON framing
 
 =head1 SYNOPSIS
 
   use Mojo::Rennari::Protocol qw(encode_frame decode_frame);
 
-  my $bytes = encode_frame('smile', { ok => 1 });
-  my $frame = decode_frame($bytes);
-  # { e => 'smile', d => { ok => 1 } }
+  my $bytes = encode_frame('smile', { ok => 1 });           # msgpack (default)
+  my $bytes = encode_frame('smile', { ok => 1 }, 'json');   # json
+
+  my $frame = decode_frame($bytes);                          # msgpack
+  my $frame = decode_frame($bytes, serializer => 'json');    # json
 
 =head1 DESCRIPTION
 
-Wire format is a single MessagePack map:
+Wire format is a single map:
 
   { e => $event_name, d => $payload }
 
-The event name is validated on both encode and decode: 1 to 64
-characters from C<[A-Za-z0-9_.:-]>. Anything else is rejected. This
-keeps event names safe to log, route, and interpolate.
+The serializer is chosen per call. C<msgpack> is the default; C<json>
+is available for environments where MessagePack is inconvenient.
+MessagePack is better for binary payloads; JSON only handles text and
+numbers cleanly.
 
-Decoding is defensive. Malformed MessagePack, non-map frames, missing
-keys, or frames larger than C<max_bytes> (default 64 KiB) all return
-C<undef>. C<decode_frame> never dies on untrusted input.
+Decoding is defensive. Malformed input, wrong shape, invalid event name,
+or frames larger than C<max_bytes> (default 64 KiB) return C<undef>.
+C<decode_frame> never dies on untrusted input.
 
-=head1 FUNCTIONS
-
-=head2 encode_frame
-
-  my $bytes = encode_frame($event, $payload);
-
-Dies on an invalid event name. The payload may be any structure
-MessagePack can encode.
-
-=head2 decode_frame
-
-  my $frame = decode_frame($bytes, max_bytes => 32768);
-
-Returns C<< { e => ..., d => ... } >> or C<undef>. Optional
-C<max_bytes> overrides the 64 KiB default.
-
-=head2 valid_event_name
-
-  valid_event_name('smile');   # 1
-  valid_event_name("bad\n");   # 0
+The serializer is a per-server choice, not a per-connection one. A
+server started with C<serializer =E<gt> 'msgpack'> only parses
+MessagePack; a server with C<serializer =E<gt> 'json'> only parses
+JSON. Mismatched frames fail to decode, same as any other malformed
+input.
 
 =cut
