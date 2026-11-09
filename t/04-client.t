@@ -6,11 +6,19 @@ use Mojo::Rennari::Server;
 use Mojo::Rennari::Protocol qw(encode_frame decode_frame);
 use Mojolicious::Lite;
 
-# Server side for the round-trip
-my $server = Mojo::Rennari::Server->new(mock => 1);
+my $server = Mojo::Rennari::Server->new(mock => 1, recovery => 1);
+
 $server->on('smile' => sub {
     my ($c, $payload) = @_;
     return { ok => 1, got => $payload };
+});
+
+$server->on('ping' => sub { return undef });
+
+$server->namespace('/chat')->on('hello' => sub {
+    my ($c, $p) = @_;
+    $c->rennari->send_to_self('hello_back', { from => '/chat', got => $p });
+    return undef;
 });
 
 websocket '/ws' => sub {
@@ -26,33 +34,69 @@ $daemon->start;
 my $port = $daemon->ports->[0];
 my $url  = "ws://127.0.0.1:$port/ws";
 
-# --- connect, send, receive reply -----------------------------------
-my ($reply, $err);
-my $client = Mojo::Rennari::Client->new(url => $url);
+my ($reply, $connect_fired, $got, $ack_result, $ack_err, $disconnect_fired);
+my $session_id;
+my $last_offset;
 
-$client->on('reply' => sub {
-    my ($client, $payload) = @_;
-    $reply = $payload;
-    Mojo::IOLoop->stop;
-});
+my $client = Mojo::Rennari::Client->new(url => $url);
+my $chat   = $client->of('/chat');
+
+$client->on('connect' => sub { $connect_fired = 1 });
+$client->on('disconnect' => sub { $disconnect_fired = 1 });
+$client->on('reply' => sub { $reply = $_[1] });
+$chat->on('hello_back' => sub { $got = $_[1] });
+
+my $run_tests = sub {
+    $session_id  = $client->session_id;
+    $last_offset = $client->last_offset;
+
+    $client->disconnect;
+};
 
 $client->connect(sub {
     my ($tx, $e) = @_;
-    if ($e) { $err = $e; Mojo::IOLoop->stop; return }
-    $client->send('smile' => { n => 42 });
+    if ($e) {
+        Mojo::IOLoop->stop;
+        return;
+    }
+
+    Mojo::IOLoop->timer(0.1 => sub {
+        $client->send('smile' => { n => 42 });
+    });
+
+    Mojo::IOLoop->timer(0.3 => sub {
+        $chat->send('hello' => { n => 1 });
+    });
+
+    Mojo::IOLoop->timer(0.5 => sub {
+        $client->emit_with_ack('ping' => { n => 1 }, sub {
+            my ($result, $err) = @_;
+            $ack_result = $result;
+            $ack_err    = $err;
+        });
+    });
+
+    Mojo::IOLoop->timer(1.0 => sub {
+        $run_tests->();
+    });
+
+    Mojo::IOLoop->timer(1.3 => sub {
+        Mojo::IOLoop->stop;
+    });
 });
 
 Mojo::IOLoop->timer(3 => sub { Mojo::IOLoop->stop });
 Mojo::IOLoop->start;
 
-is $err, undef, 'connected without error';
-is_deeply $reply, { ok => 1, got => { n => 42 } },
-    'client received reply with original payload';
-
-# --- disconnect ------------------------------------------------------
-ok $client->is_connected, 'still connected';
-$client->disconnect;
-ok !$client->is_connected, 'disconnected';
+is $connect_fired, 1, 'connect local event fired';
+is_deeply $reply, { ok => 1, got => { n => 42 } }, 'reply round-trip';
+is_deeply $got, { from => '/chat', got => { n => 1 } }, 'namespace round-trip';
+is $ack_err, undef, 'ack received without error';
+ok $ack_result && $ack_result->{id}, 'ack carries an id';
+ok defined $session_id, 'session id present';
+ok $last_offset >= 0, 'offset tracked';
+ok $disconnect_fired, 'disconnect local event fired';
+ok !$client->is_connected, 'is_connected false after disconnect';
 
 # --- mock guard ------------------------------------------------------
 {

@@ -57,10 +57,13 @@ package TestConn {
     }
 
     sub send {
-        my ($self, $event, $payload) = @_;
-        $self->tx->send(
-            {binary => Mojo::Rennari::Protocol::encode_frame($event, $payload)}
-        );
+        my ($self, $event, $payload, $nsp) = @_;
+        $self->tx->send({
+            binary => Mojo::Rennari::Protocol::encode_frame(
+                $event, $payload, undef, undef, undef,
+                ($nsp && $nsp ne '/' ? $nsp : undef),
+            ),
+        });
     }
 
     sub clear { @{ $_[0]->frames } = () }
@@ -98,7 +101,7 @@ is $ok->{d}{name}, '/chat', 'ack names /chat';
 
 # --- Test 3: /chat handler fires -------------------------------------
 $a->clear;
-$a->send('hello', { n => 2 });
+$a->send('hello', { n => 2 }, '/chat');
 $wait->(0.3); Mojo::IOLoop->start;
 
 my ($r2) = $a->frames_of('hello_back');
