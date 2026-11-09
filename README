@@ -9,10 +9,24 @@ clone, not a drop-in replacement. It offers the features that matter for
 a Mojolicious app: custom events, rooms, namespaces, acknowledgements,
 reconnection, and connection state recovery.
 
+Ships both a server and a client.
+
 STATUS
 
-Working. Perl server and JavaScript client are wire-compatible and tested
-against each other. See rennari-client-js for the JavaScript side.
+Working. Server and client are tested against each other. The protocol
+is implemented in seven languages; this repo is the reference
+implementation and the origin of the specification.
+
+    Protocol specification: PROTOCOL.md
+
+Other implementations:
+
+    rennari-client-js   JavaScript client
+    rennari-server-js   JavaScript server
+    rennari-go          Go client and server
+    rennari-py          Python client and server
+    rennari-rs          Rust client and server
+    rennari-java        Java client and server
 
 INSTALL
 
@@ -22,7 +36,7 @@ Or with carton:
 
     carton install
 
-QUICK START
+QUICK START — SERVER
 
     use Mojolicious::Lite;
     use Mojo::Rennari::Server;
@@ -32,7 +46,7 @@ QUICK START
             my $c = shift;
             my $token = $c->param('token') // return undef;
             return undef unless $token eq 'secret';
-            return { user_id => 42 };
+            return { id => 'user-1' };
         },
     );
 
@@ -49,9 +63,33 @@ QUICK START
 
     app->start;
 
-The client connects to /ws?token=secret and sends
-{e: 'chat', d: {room: 'lobby', text: 'hi'}}. Every member of lobby
-receives it, sender included.
+QUICK START — CLIENT
+
+    use Mojo::Rennari::Client;
+    use Mojo::IOLoop;
+
+    my $client = Mojo::Rennari::Client->new(
+        url => 'ws://127.0.0.1:3000/ws?token=secret',
+    );
+
+    $client->on('connect' => sub {
+        my $c = shift;
+        $c->of('/chat')->send('hello' => { n => 1 });
+    });
+
+    $client->on('reply' => sub {
+        my ($c, $payload) = @_;
+        say 'reply: ', $payload->{ok};
+    });
+
+    my $chat = $client->of('/chat');
+    $chat->on('hello_back' => sub {
+        my ($c, $payload) = @_;
+        say 'chat: ', $payload->{got}{n};
+    });
+
+    $client->connect;
+    Mojo::IOLoop->start;
 
 CORE CONCEPTS
 
@@ -119,8 +157,8 @@ A client joins with {e: 'rennari_nsp', d: {name: '/chat'}}. The server
 replies rennari_nsp_ok. Frames for a namespace the client has not joined
 close the connection with code 4005.
 
-Every frame the server sends carries the namespace in n. The client
-dispatches by that field, so no connection state is involved.
+Every frame the server sends carries the namespace in n. Both sides
+dispatch by that field, so no connection state is involved.
 
 Acknowledgements
 
@@ -158,7 +196,7 @@ A session that is unknown, expired, or still attached to a live connection
 gets rennari_resume_failed.
 
 Without recovery, no o field is present on any frame and no session
-frame is sent. Behavior is unchanged from the simple protocol.
+frame is sent.
 
 Mock mode
 
@@ -167,6 +205,41 @@ Mock mode
 Skips auth_cb, synthesizes an identity, and ignores unknown events.
 Refused automatically when MOJO_MODE is production, unless
 force_mock => 1. For development only.
+
+CLIENT
+
+    my $client = Mojo::Rennari::Client->new(
+        url         => 'ws://example.com/ws',
+        serializer  => undef,           # msgpack or 'json'
+        ack_timeout => 5,
+        retries     => 3,
+    );
+
+    $client->on('connect' => sub { my $c = shift; ... });
+    $client->on('disconnect' => sub { my ($c, $info) = @_; ... });
+    $client->on('error' => sub { my ($c, $msg) = @_; ... });
+    $client->on('ack_timeout' => sub { my ($c, $info) = @_; ... });
+    $client->on('recovered' => sub { my ($c, $info) = @_; ... });
+
+    $client->on('event', sub { my ($c, $payload) = @_; ... });
+    $client->send('event', { ... });
+
+    my $nsp = $client->of('/chat');
+    $nsp->on('message', sub { my ($c, $payload) = @_; ... });
+    $nsp->send('message', { ... });
+
+    $client->emit_with_ack('ping', { ... }, sub {
+        my ($result, $err) = @_;
+    });
+
+    $client->connect;
+    $client->disconnect;
+    $client->is_connected;
+    $client->session_id;     # set after connect when recovery is on
+    $client->last_offset;    # highest offset seen
+
+The client declares all non-default namespaces it has registered
+immediately after connecting.
 
 CLOSE CODES
 
@@ -178,6 +251,8 @@ CLOSE CODES
 
 CONFIGURATION
 
+Server:
+
     my $rennari = Mojo::Rennari::Server->new(
         auth_cb            => sub { ... },   # required in production
         serializer         => 'msgpack',     # or 'json'
@@ -188,6 +263,20 @@ CONFIGURATION
         mock               => 0,             # development only
         force_mock         => 0,             # overrides production refusal
         logger             => Mojo::Log->new,
+    );
+
+Client:
+
+    my $client = Mojo::Rennari::Client->new(
+        url          => 'ws://...',
+        serializer   => undef,       # msgpack or 'json'
+        max_bytes    => 64 * 1024,
+        ack_timeout  => 5,
+        retries      => 3,
+        mock         => 0,
+        force_mock   => 0,
+        logger       => undef,
+        ua           => undef,       # Mojo::UserAgent
     );
 
 SECURITY
@@ -206,12 +295,14 @@ The framework does not implement rate limiting. If you expose the server
 publicly, add per-connection frame budgets at the application level, or
 use a reverse proxy.
 
-JAVASCRIPT CLIENT
+EXAMPLES
 
-The companion JavaScript client lives in rennari-client-js. It speaks the
-same wire format: MessagePack or JSON frames, namespaces by n, acks with
-id, session recovery with o and session_id. Works in Node 18+ and any
-modern browser.
+examples/app.pl and examples/client.pl are a runnable server and client
+pair. examples/app_production.pl and examples/client_production.pl show
+first-message authentication instead of URL query parameters.
+
+    carton exec -- perl -Ilib examples/app.pl daemon -l http://127.0.0.1:3000
+    carton exec -- perl -Ilib examples/client.pl 3000
 
 LICENSE
 
