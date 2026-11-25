@@ -3,8 +3,9 @@ use Mojo::Base -strict;
 use Data::MessagePack;
 use Mojo::JSON qw(encode_json decode_json);
 use Exporter 'import';
+use bytes ();
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 our @EXPORT_OK = qw(
     encode_frame decode_frame
@@ -28,6 +29,11 @@ sub valid_id {
     my ($id) = @_;
     return 0 if !defined $id || ref $id;
     return $id =~ /\A[0-9]{1,20}\z/ ? 1 : 0;
+}
+
+sub valid_offset {
+    my ($offset) = @_;
+    return defined $offset && !ref $offset && $offset =~ /\A[0-9]+\z/;
 }
 
 sub valid_namespace_name {
@@ -56,7 +62,7 @@ sub encode_frame {
         $frame->{id} = $id + 0;    # coerce to number
     }
     if (defined $offset) {
-        die 'encode_frame: invalid offset' unless $offset =~ /\A[0-9]+\z/;
+        die 'encode_frame: invalid offset' unless valid_offset($offset);
         $frame->{o} = $offset + 0;
     }
     # the default namespace is implied and omitted from the wire
@@ -74,7 +80,7 @@ sub decode_frame {
 
     my $serializer = _check_serializer($opts{serializer});
     my $max        = $opts{max_bytes} // DEFAULT_MAX_BYTES;
-    return undef if length($bytes) > $max;
+    return undef if bytes::length($bytes) > $max;
 
     my $frame;
     if ($serializer eq 'json') {
@@ -90,7 +96,7 @@ sub decode_frame {
     return undef unless exists $frame->{d};
 
     if (exists $frame->{o}) {
-        return undef unless $frame->{o} =~ /\A[0-9]+\z/;
+        return undef unless valid_offset($frame->{o});
         $frame->{o} += 0;
     }
 

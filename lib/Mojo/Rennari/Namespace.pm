@@ -1,8 +1,8 @@
 package Mojo::Rennari::Namespace;
 use Mojo::Base -base;
-use Mojo::Rennari::Protocol qw(encode_frame);
+use Mojo::Rennari::Protocol qw(valid_event_name);
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 has 'name'         => '/';
 has 'server';
@@ -13,7 +13,7 @@ has '_connections' => sub { {} };   # id    -> 1
 sub on {
     my ($self, $event, $cb) = @_;
     die 'on: invalid event name'
-        unless Mojo::Rennari::Protocol::valid_event_name($event);
+        unless valid_event_name($event);
     die 'on: handler must be a code ref'
         unless ref $cb eq 'CODE';
     $self->_handlers->{$event} = $cb;

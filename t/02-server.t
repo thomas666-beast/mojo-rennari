@@ -1,4 +1,4 @@
-use v5.36;
+use 5.020;
 use Test::More;
 use Mojo::Rennari::Server;
 use Mojo::Rennari::Protocol qw(encode_frame decode_frame);

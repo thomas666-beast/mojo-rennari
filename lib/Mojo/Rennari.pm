@@ -1,7 +1,7 @@
 package Mojo::Rennari;
 use Mojo::Base -strict;
 
-our $VERSION = '0.001';
+our $VERSION = '0.003';
 
 1;
 __END__
@@ -17,13 +17,15 @@ Mojo::Rennari - real-time event transport for Mojolicious
 
   my $rennari = Mojo::Rennari::Server->new(
       auth_cb => sub ($c) {
+          my ($c) = @_;
           my $token = $c->param('token') // return undef;
           return undef unless $token eq 'valid';
-          return { user_id => 42 };
+          return { id => 'user-42' };
       },
   );
 
-  $rennari->on('smile' => sub ($c, $payload) {
+  $rennari->on('smile' => sub {
+      my ($c, $payload) = @_;
       return { ok => 1, received => $payload };
   });
 
@@ -53,6 +55,17 @@ transport is a thin JavaScript bridge written later.
 =back
 
 The name comes from Old Norse I<rennari>, "runner, messenger, envoy."
+
+=head1 PROJECT GENERATOR
+
+    mojo-rennari generate lite demo
+    mojo-rennari generate app MyApp
+
+The Lite generator writes C<server.pl> and C<client.pl>. The App
+generator creates C<server/> and C<client/> trees with class-based
+modules and independent runners. Both starters read YAML configuration files and use C<TOKEN_APP>
+for application access. User authentication is configured separately in
+C<auth_cb>. No token environment exports are required. Run C<mojo-rennari help> for usage.
 
 =head1 LICENSE
 

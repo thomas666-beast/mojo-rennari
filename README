@@ -5,9 +5,8 @@ Real-time WebSocket messaging for Mojolicious applications, named after
 the Old Norse rennari — "runner, messenger, envoy".
 
 A small, secure, MessagePack- or JSON-framed event layer. Not a Socket.IO
-clone, not a drop-in replacement. It offers the features that matter for
-a Mojolicious app: custom events, rooms, namespaces, acknowledgements,
-reconnection, and connection state recovery.
+clone, not a drop-in replacement. It supports custom events, rooms,
+namespaces, acknowledgements, and server-side connection state recovery.
 
 Ships both a server and a client.
 
@@ -28,13 +27,75 @@ Other implementations:
     rennari-rs          Rust client and server
     rennari-java        Java client and server
 
-INSTALL
+INSTALL FROM THIS SOURCE TREE
 
-    cpanm Mojo::Rennari
+    cpanm --installdeps .
+    perl Makefile.PL
+    make
+    make test
+    make install
 
-Or with carton:
+Use the Perl installation that will run your applications. If the
+command is not on PATH after installation, use that installation''s
+script directory. To try it without installing:
 
-    carton install
+    perl -Mblib blib/script/mojo-rennari --help
+
+GENERATE A PROJECT
+
+Lite: two standalone scripts in a new directory.
+
+    mojo-rennari generate lite demo
+    cd demo
+
+First terminal:
+
+    export RENNARI_TOKEN='choose-a-local-demo-token'
+    perl server.pl daemon -l http://127.0.0.1:3000
+
+Second terminal, from the same directory:
+
+    export RENNARI_TOKEN='choose-a-local-demo-token'
+    perl client.pl "Hello"
+
+The client prints `Reply: Hello` and exits. A failed handshake or a
+missing reply produces a nonzero status. The server exposes `/ws` for
+messages and `/health` for an HTTP health check.
+
+App: separate server and client runners with their own Perl libraries.
+
+    mojo-rennari generate app MyApp
+    cd my_app
+
+    my_app/
+        cpanfile
+        README.md
+        server/
+            script/server
+            lib/MyApp/Server.pm
+            lib/MyApp/Server/Events.pm
+        client/
+            script/client
+            lib/MyApp/Client.pm
+
+Set the same token in each terminal and use these runners in place of
+the Lite scripts:
+
+    perl server/script/server daemon -l http://127.0.0.1:3000
+    perl client/script/client "Hello"
+
+Names such as `Acme::Chat` are supported and generate `acme-chat/`.
+Run `mojo-rennari help` for default names and `mojo-rennari --version`
+to identify the installed version. Existing destinations are refused.
+
+Both starters send the token in the Authorization header. They default
+to MessagePack. To use JSON, set `RENNARI_SERIALIZER=json` in both
+terminals. Set `RENNARI_URL` if the client needs a different WebSocket
+endpoint, for example `ws://127.0.0.1:4000/ws`.
+
+These are local starters, not production authentication systems.
+Before exposing either app, use TLS (`wss://`), keep credentials out of
+source control, and replace the single demo-token policy.
 
 QUICK START — SERVER
 
@@ -74,18 +135,14 @@ QUICK START — CLIENT
 
     $client->on('connect' => sub {
         my $c = shift;
-        $c->of('/chat')->send('hello' => { n => 1 });
+        $c->send('chat' => { room => 'lobby', text => 'Hello' });
     });
 
-    $client->on('reply' => sub {
+    $client->on('chat' => sub {
         my ($c, $payload) = @_;
-        say 'reply: ', $payload->{ok};
-    });
-
-    my $chat = $client->of('/chat');
-    $chat->on('hello_back' => sub {
-        my ($c, $payload) = @_;
-        say 'chat: ', $payload->{got}{n};
+        print $payload->{text}, "\n";
+        $c->disconnect;
+        Mojo::IOLoop->stop;
     });
 
     $client->connect;
@@ -111,8 +168,9 @@ WebSocket frames, always.
 Authentication
 
 auth_cb runs during the HTTP request, before the WebSocket upgrade. A
-falsy return renders 401 and no socket is opened. The returned identity
-is available to handlers via $c->stash('rennari_identity').
+falsy return renders 401 and no socket is opened. On success return an
+identity hash reference, available via $c->stash('rennari_identity').
+Recovery requires a stable id field in that hash.
 
 Events
 
@@ -163,8 +221,10 @@ dispatch by that field, so no connection state is involved.
 Acknowledgements
 
 A client can send an id with any event. The server replies
-{e: 'rennari_ack', d: {id: $id}} after the handler succeeds. If the
-handler dies, no ack is sent, and the client's retry loop resends.
+{e: 'rennari_ack', d: {id: $id}} after the handler succeeds. If a
+handler dies, no ack is sent. While the connection is open, the Perl
+client can retry on timeout using the same acknowledgement ID.
+On disconnect it reports outstanding acknowledgements as errors.
 Duplicate delivery is possible; the framework does not deduplicate.
 Handlers should be idempotent if retries are used.
 
@@ -193,7 +253,15 @@ that would have been sent to it buffered. On reconnect, the client sends
 {e: 'rennari_resume', d: {session_id, offset}}. The server replays missed
 frames, re-attaches namespaces and rooms, and replies rennari_resumed.
 A session that is unknown, expired, or still attached to a live connection
-gets rennari_resume_failed.
+gets rennari_resume_failed. Only the same authenticated identity can
+resume a session. Recovery state is process-local. Direct sends to an
+offline connection can be buffered; room broadcasts use current
+membership. An offline session is invalidated if its buffer exceeds
+256 frames or 1 MiB by default. Configure recovery_max_frames and
+recovery_max_bytes to change those limits.
+
+The Perl client exposes the session ID and offset but does not
+automatically reconnect or send resume requests.
 
 Without recovery, no o field is present on any frame and no session
 frame is sent.
@@ -210,7 +278,7 @@ CLIENT
 
     my $client = Mojo::Rennari::Client->new(
         url         => 'ws://example.com/ws',
-        serializer  => undef,           # msgpack or 'json'
+        serializer  => 'msgpack',       # or 'json'; must match the server
         ack_timeout => 5,
         retries     => 3,
     );
@@ -259,6 +327,8 @@ Server:
         max_bytes          => 64 * 1024,     # max frame size
         recovery           => 0,             # enable session recovery
         recovery_window    => 120,           # seconds
+        recovery_max_frames => 256,          # per offline session
+        recovery_max_bytes  => 1024 * 1024,  # per offline session
         inactivity_timeout => 300,           # seconds, overrides Mojo's 30s default
         mock               => 0,             # development only
         force_mock         => 0,             # overrides production refusal
@@ -269,7 +339,8 @@ Client:
 
     my $client = Mojo::Rennari::Client->new(
         url          => 'ws://...',
-        serializer   => undef,       # msgpack or 'json'
+        headers      => {Authorization => "Bearer $token"},
+        serializer   => 'msgpack',   # or 'json'
         max_bytes    => 64 * 1024,
         ack_timeout  => 5,
         retries      => 3,
@@ -301,8 +372,8 @@ examples/app.pl and examples/client.pl are a runnable server and client
 pair. examples/app_production.pl and examples/client_production.pl show
 first-message authentication instead of URL query parameters.
 
-    carton exec -- perl -Ilib examples/app.pl daemon -l http://127.0.0.1:3000
-    carton exec -- perl -Ilib examples/client.pl 3000
+    perl -Ilib examples/app.pl daemon -l http://127.0.0.1:3000
+    perl -Ilib examples/client.pl 3000
 
 LICENSE
 

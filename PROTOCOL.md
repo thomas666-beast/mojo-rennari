@@ -1,7 +1,6 @@
 Rennari Protocol
 ================
 
-Version 0.1
 Status: stable, implemented in seven languages
 
 This document is the normative specification. Implementations:
@@ -216,6 +215,12 @@ When enabled:
   offset, re-attaches namespaces and rooms, and sends rennari_resumed.
 - If the session is unknown, expired, or still attached to a live
   connection, the server sends rennari_resume_failed.
+
+Mojo::Rennari also requires the same authenticated identity when
+resuming outside mock mode. Its server stores recovery state in the
+process handling the connection. Each offline buffer has configurable
+frame and byte limits, and exceeding either limit invalidates the
+session. The Perl client does not automatically reconnect or resume.
 
 The offset is per session, not global. It resets when a session is
 replaced by a fresh connection (i.e. after expiry or resume failure).

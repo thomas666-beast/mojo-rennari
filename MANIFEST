@@ -1,0 +1,35 @@
+.gitignore
+Makefile.PL
+MANIFEST
+PROTOCOL.md
+README
+examples/app.pl
+examples/app_production.pl
+examples/client.pl
+examples/client_production.pl
+lib/Mojo/Rennari.pm
+lib/Mojo/Rennari/Client.pm
+lib/Mojo/Rennari/Connection.pm
+lib/Mojo/Rennari/Generator.pm
+lib/Mojo/Rennari/Namespace.pm
+lib/Mojo/Rennari/Protocol.pm
+lib/Mojo/Rennari/Server.pm
+script/mojo-rennari
+t/00-load.t
+t/01-protocol.t
+t/02-server.t
+t/03-mock.t
+t/04-client.t
+t/05-rooms.t
+t/06-hooks.t
+t/07-custom-events.t
+t/08-namespaces.t
+t/09-serializer.t
+t/10-acks.t
+t/11-recovery.t
+t/12-client-correctness.t
+t/13-generator.t
+t/14-recovery-limits.t
+t/99-debug.t
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)

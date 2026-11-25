@@ -1,4 +1,4 @@
-use v5.36;
+use 5.020;
 use Test::More;
 use Test::Mojo;
 use Mojolicious::Lite;

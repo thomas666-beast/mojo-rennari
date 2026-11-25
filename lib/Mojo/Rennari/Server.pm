@@ -1,11 +1,13 @@
 package Mojo::Rennari::Server;
 use Mojo::Base -base;
-use Mojo::Rennari::Protocol qw(encode_frame decode_frame);
+use Mojo::Rennari::Protocol qw(encode_frame decode_frame valid_namespace_name);
 use Mojo::Rennari::Connection;
 use Mojo::Rennari::Namespace;
 use Mojo::IOLoop;
+use Mojo::Util ();
+use bytes ();
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 {
     no strict 'refs';
@@ -24,6 +26,8 @@ has 'serializer'      => 'msgpack';
 has 'logger';
 has 'recovery'        => 0;
 has 'recovery_window' => 120;
+has 'recovery_max_frames' => 256;
+has 'recovery_max_bytes'  => 1024 * 1024;
 has 'inactivity_timeout' => 300;
 
 has 'on_connect_cb';
@@ -38,6 +42,7 @@ has '_next_id'     => 0;
 sub namespace {
     my ($self, $name) = @_;
     $name //= '/';
+    die 'namespace: invalid namespace' unless valid_namespace_name($name);
     return $self->_namespaces->{$name}
         //= Mojo::Rennari::Namespace->new(name => $name, server => $self);
 }
@@ -52,9 +57,10 @@ sub on_disconnect { my ($s, $cb) = @_; die 'code ref' unless ref $cb eq 'CODE'; 
 sub on_error      { my ($s, $cb) = @_; die 'code ref' unless ref $cb eq 'CODE'; $s->on_error_cb($cb);      $s }
 
 sub _mock_enabled {
-    my $self = shift;
+    my ($self, $mode) = @_;
     return 0 unless $self->mock;
-    if (($ENV{MOJO_MODE} // '') eq 'production' && !$self->force_mock) {
+    if ((($mode // '') eq 'production' || ($ENV{MOJO_MODE} // '') eq 'production')
+        && !$self->force_mock) {
         die 'mock mode refused in production (set force_mock to override)';
     }
     return 1;
@@ -75,10 +81,20 @@ sub _fire {
 }
 
 sub _new_session_id {
-    my $self = shift;
-    my $id = '';
-    $id .= sprintf '%02x', int(rand(256)) for 1 .. 16;
-    return $id;
+    if (my $random = Mojo::Util->can('random_bytes')) {
+        return unpack 'H*', $random->(16);
+    }
+
+    # Older Mojolicious versions do not provide random_bytes.
+    open my $source, '<:raw', '/dev/urandom'
+        or die "No secure randomness available for recovery: $!";
+    my $bytes = '';
+    while (length($bytes) < 16) {
+        my $read = sysread $source, $bytes, 16 - length($bytes), length($bytes);
+        next if !defined $read && $!{EINTR};
+        die "Cannot read secure randomness for recovery: $!" unless $read;
+    }
+    return unpack 'H*', $bytes;
 }
 
 sub _session_of {
@@ -122,24 +138,41 @@ sub _send_to_connection {
     my $s    = $self->serializer;
 
     if ($conn && $conn->{tx} && !$conn->{offline}) {
-        my $next_offset;
-        if ($self->recovery) {
-            $next_offset = ++$conn->{offset};
-            if ($conn->{session_id} && (my $sess = $self->_sessions->{ $conn->{session_id} })) {
-                $sess->{offset} = $next_offset;
-            }
+        my $next_offset = $self->recovery ? $conn->{offset} + 1 : undef;
+        my $sent = eval {
+            my $bytes = encode_frame($event, $payload, $s, undef, $next_offset, $nsp);
+            $conn->{tx}->send({binary => $bytes});
+            1;
+        };
+        unless ($sent) {
+            $self->_log(warn => "rennari: send failed: $@");
+            return 0;
         }
-        my $bytes = encode_frame($event, $payload, $s, undef, $next_offset, $nsp);
-        eval { $conn->{tx}->send({binary => $bytes}) };
-        $self->_log(warn => "rennari: send failed: $@") if $@;
+        if (defined $next_offset) {
+            $conn->{offset} = $next_offset;
+            my $sess = $self->_session_of($id);
+            $sess->{offset} = $next_offset if $sess;
+        }
         return 1;
     }
 
     # offline: buffer if recovery
     return 0 unless $self->recovery;
     my $session = $self->_session_of($id) or return 0;
-    my $offset  = ++$session->{offset};
-    my $bytes   = encode_frame($event, $payload, $s, undef, $offset, $nsp);
+    my $offset = $session->{offset} + 1;
+    my $bytes = eval { encode_frame($event, $payload, $s, undef, $offset, $nsp) };
+    unless (defined $bytes) {
+        $self->_log(warn => "rennari: buffer failed: $@");
+        return 0;
+    }
+    my $size = $session->{buffered_bytes} + bytes::length($bytes);
+    if (@{ $session->{buffered} } >= $self->recovery_max_frames || $size > $self->recovery_max_bytes) {
+        delete $self->_sessions->{ $session->{id} };
+        delete $self->_connections->{$id};
+        return 0;
+    }
+    $session->{offset} = $offset;
+    $session->{buffered_bytes} = $size;
     push @{ $session->{buffered} }, { offset => $offset, bytes => $bytes };
     return 1;
 }
@@ -147,7 +180,8 @@ sub _send_to_connection {
 sub websocket_route {
     my ($self, $c) = @_;
 
-    my $mock = $self->_mock_enabled;
+    my $mock = $self->_mock_enabled($c->app->mode);
+    my $s = Mojo::Rennari::Protocol::_check_serializer($self->serializer);
 
     my $identity;
     if ($mock) {
@@ -167,15 +201,23 @@ sub websocket_route {
         unless ($identity) {
             return $c->render(status => 401, text => 'unauthorized');
         }
+        unless (ref $identity eq 'HASH') {
+            $self->_log(error => 'auth_cb must return a hash reference or reject authentication');
+            return $c->render(status => 500, text => 'auth error');
+        }
+        if ($self->recovery && !(defined $identity->{id} && !ref $identity->{id} && length $identity->{id})) {
+            $self->_log(error => 'recovery requires a stable identity id from auth_cb');
+            return $c->render(status => 500, text => 'auth error');
+        }
     }
 
+    my $identity_id = $identity->{id} // '(unspecified)';
     # Mojolicious closes idle connections after 30s by default
     $c->inactivity_timeout($self->inactivity_timeout);
 
     my $id      = ++$self->{_next_id};
-    my $session = $self->_new_session_id;
+    my $session = $self->recovery ? $self->_new_session_id : undef;
     my $conn    = Mojo::Rennari::Connection->new(server => $self, id => $id);
-    my $s       = $self->serializer;
 
     $c->stash(rennari_id       => $id);
     $c->stash(rennari_session  => $session);
@@ -184,7 +226,8 @@ sub websocket_route {
 
     $self->_connections->{$id} = {
         tx         => $c->tx,
-        identity   => $identity,
+        owner_id   => "$identity_id",
+        mock       => $mock,
         session_id => $session,
         namespaces => {},
         offset     => 0,
@@ -194,11 +237,13 @@ sub websocket_route {
     if ($self->recovery) {
         $self->_sessions->{$session} = {
             id         => $session,
-            identity   => $identity,
+            owner_id   => "$identity_id",
+            mock       => $mock,
             namespaces => {},
             rooms      => {},
             offset     => 0,
             buffered   => [],
+            buffered_bytes => 0,
             conn_id    => $id,
             offline    => 0,
             gen        => 0,
@@ -220,7 +265,7 @@ sub websocket_route {
     my $max     = $self->max_bytes;
     my $is_mock = $mock;
 
-    $self->_log(info => "rennari: connection opened ($identity->{id})");
+    $self->_log(info => "rennari: connection opened ($identity_id)");
     $self->_fire(connect => $c, $identity);
 
     $c->on(message => sub {
@@ -230,7 +275,7 @@ sub websocket_route {
             $bytes, max_bytes => $max, serializer => $s,
         );
         unless ($frame) {
-            $self->_log(warn => "rennari: bad frame from $identity->{id}");
+            $self->_log(warn => "rennari: bad frame from $identity_id");
             $self->_fire(error => $c, 'bad_frame', undef);
             return $c->tx->finish(4002, 'bad frame');
         }
@@ -241,16 +286,16 @@ sub websocket_route {
 
         # --- resume -------------------------------------------------
         if ($event eq 'rennari_resume') {
-            return $self->_handle_resume($c, $id, $data, $s);
+            return $self->_handle_resume($c, $id, $data);
         }
 
         # --- namespace join -----------------------------------------
         if ($event eq 'rennari_nsp') {
-            my $name = (ref $data eq 'HASH' ? $data->{name} : undef) // '/';
-            my $nsp  = $self->_namespaces->{$name};
+            my $name = ref $data eq 'HASH' ? $data->{name} : undef;
+            my $nsp  = valid_namespace_name($name) ? $self->_namespaces->{$name} : undef;
             unless ($nsp) {
-                $self->_log(warn => "rennari: unknown namespace '$name'");
-                $self->_fire(error => $c, 'unknown_namespace', $name);
+                $self->_log(warn => 'rennari: missing, invalid, or unknown namespace');
+                $self->_fire(error => $c, 'unknown_namespace', ref $name ? undef : $name);
                 return $c->tx->finish(4005, 'unknown namespace');
             }
             $nsp->attach($id);
@@ -290,8 +335,9 @@ sub websocket_route {
             return $c->tx->finish(4004, 'handler error');
         }
 
-        if (defined $reply) {
-            $self->_send_to_connection($id, 'reply', $reply, $nsp_name);
+        if (defined $reply && !$self->_send_to_connection($id, 'reply', $reply, $nsp_name)) {
+            $self->_fire(error => $c, 'handler_error', $event);
+            return $c->tx->finish(4004, 'handler error');
         }
 
         if (defined $fid) {
@@ -300,7 +346,7 @@ sub websocket_route {
     });
 
     $c->on(finish => sub {
-        $self->_log(info => "rennari: connection closed ($identity->{id})");
+        $self->_log(info => "rennari: connection closed ($identity_id)");
         my $rec = $self->_connections->{$id};
 
         if ($rec) {
@@ -327,6 +373,7 @@ sub websocket_route {
                 $sess->{conn_id}    = $id;
                 $sess->{offline}    = 1;
                 $rec->{offline}     = 1;
+                delete $rec->{tx};
                 my $gen = ++$sess->{gen};
 
                 Mojo::IOLoop->timer($self->recovery_window => sub {
@@ -349,22 +396,22 @@ sub websocket_route {
 }
 
 sub _handle_resume {
-    my ($self, $c, $new_id, $data, $s) = @_;
+    my ($self, $c, $new_id, $data) = @_;
 
     return $c->tx->finish(4006, 'recovery disabled') unless $self->recovery;
 
     $data = {} unless ref $data eq 'HASH';
-    my $sid    = $data->{session_id} // '';
+    my $sid    = $data->{session_id};
     my $offset = $data->{offset}     // -1;
-    $offset = -1 unless $offset =~ /\A-?[0-9]+\z/;
-
-    my $sess = $sid ne '' ? $self->_sessions->{$sid} : undef;
-    unless ($sess && $sess->{offline}) {
+    $offset = -1 unless Mojo::Rennari::Protocol::valid_offset($offset);
+    my $new = $self->_connections->{$new_id};
+    my $sess = defined $sid && !ref $sid && $sid =~ /\A[0-9a-f]{32}\z/
+        ? $self->_sessions->{$sid} : undef;
+    unless ($sess && $sess->{offline} && !$new->{resumed} && $sess->{mock} == $new->{mock}
+        && ($sess->{mock} || $sess->{owner_id} eq $new->{owner_id})) {
         return $self->_send_to_connection($new_id, 'rennari_resume_failed',
             { reason => 'unknown_session' });
     }
-
-    my $new = $self->_connections->{$new_id};
 
     # drop the throwaway session created for this connection and the
     # offline record of the connection being resumed
@@ -393,10 +440,13 @@ sub _handle_resume {
     # transfer the session to the new connection
     $new->{session_id} = $sid;
     $new->{offset}     = $sess->{offset};
+    $new->{resumed}    = 1;
     $sess->{buffered}  = [];
+    $sess->{buffered_bytes} = 0;
     $sess->{conn_id}   = $new_id;
     $sess->{offline}   = 0;
     $sess->{gen}++;    # cancels the pending expiry timer
+    $c->stash(rennari_session => $sid);
 
     # report the session id so the client keeps using it, not the
     # throwaway one announced when this socket opened
@@ -444,7 +494,14 @@ session that is unknown, expired, or still attached to a live connection
 gets C<rennari_resume_failed>.
 
 Sessions and their offline connection records are removed
-C<recovery_window> seconds after disconnect unless resumed.
+C<recovery_window> seconds after disconnect unless resumed. When
+recovery is enabled outside mock mode, the C<auth_cb> identity must
+contain a stable C<id>. Only a connection authenticated as that same
+identity can resume its session.
+
+Offline buffers are limited per session by C<recovery_max_frames>
+(default 256) and C<recovery_max_bytes> (default 1 MiB). Exceeding
+either limit invalidates the offline session. Recovery is process-local.
 
 =head1 LICENSE
 

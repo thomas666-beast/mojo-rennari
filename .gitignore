@@ -3,7 +3,10 @@
 /blib/
 /pm_to_blib
 /MYMETA.*
+/Mojo-Rennari-*/
+/Mojo-Rennari-*.tar.gz
 /.build/
 *.swp
 *~
 /.DS_Store
+cpanfile.snapshot

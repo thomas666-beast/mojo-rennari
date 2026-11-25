@@ -1,7 +1,7 @@
 package Mojo::Rennari::Connection;
 use Mojo::Base -base;
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 has 'server';
 has 'id';

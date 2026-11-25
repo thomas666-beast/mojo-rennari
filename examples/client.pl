@@ -1,5 +1,5 @@
 #!/usr/bin/env perl
-use v5.36;
+use 5.020;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Mojo::IOLoop;
