@@ -10,10 +10,16 @@ use Mojo::Rennari::Server;
 use Mojo::Server::Daemon;
 use Mojolicious;
 
+my $APP = 'test-only-application-token-1234567890';
+
 my $quiet = Mojo::Log->new(level => 'fatal');
 my $app = Mojolicious->new(log => $quiet);
-my $headers = {Authorization => 'Bearer integration-test-token'};
+my $headers = {
+    Authorization         => 'Bearer integration-test-token',
+    'X-Rennari-App-Token' => $APP,
+};
 my $server = Mojo::Rennari::Server->new(
+    app_token => $APP,
     logger => $quiet, serializer => 'json',
     auth_cb => sub {
         return unless ($_[0]->req->headers->authorization // '') eq $headers->{Authorization};

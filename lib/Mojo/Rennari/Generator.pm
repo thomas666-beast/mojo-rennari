@@ -252,7 +252,6 @@ use FindBin;
 use lib "$FindBin::Bin/../lib";
 use Mojolicious::Lite;
 use Mojo::Rennari::Server;
-use Mojo::Util qw(secure_compare);
 use YAML::PP;
 
 # Load connection and application-access settings.
@@ -336,7 +335,6 @@ Mojolicious::Commands->start_app('__APP__::Server');
 package __APP__::Server;
 use Mojo::Base 'Mojolicious';
 use Mojo::Rennari::Server;
-use Mojo::Util qw(secure_compare);
 use YAML::PP;
 use __APP__::Server::Events ();
 
@@ -476,24 +474,21 @@ sub build_server {
     my ($config, $logger) = @_;
 
     return Mojo::Rennari::Server->new(
+        # The server checks TOKEN_APP itself: from the X-Rennari-App-Token
+        # header (Perl, Node, ...) or from the first 'auth' message
+        # (browsers).
+        app_token  => $config->{TOKEN_APP},
         serializer => $config->{serializer},
         logger     => $logger,
 
+        # Runs only after TOKEN_APP is accepted.
         auth_cb => sub {
-            my $c = shift;
-
-            # Application access:
-            # require the shared application credential from YAML.
-            my $provided = $c->req->headers->header(
-                'X-Rennari-App-Token'
-            ) // '';
-
-            return undef
-                unless secure_compare($provided, $config->{TOKEN_APP});
+            my ($c, $info) = @_;
 
             # USER AUTHENTICATION GOES HERE.
             #
-            # Validate your user's session or Authorization header.
+            # $info->{token} is the user's bearer token (the Authorization
+            # header for Perl and Node clients).
             # Return that user's identity on success.
             # Return undef to reject authentication.
             #
@@ -884,7 +879,7 @@ Authorize room access before joining or broadcasting private data.
 ## Authentication
 
 TOKEN_APP is sent through the X-Rennari-App-Token handshake header and
-checked in auth_cb.
+checked by the server before auth_cb runs.
 
 It checks possession of a shared application credential. It is not user
 authentication or proof that a connection comes from an approved program.
@@ -999,7 +994,7 @@ private data.
 ## Authentication
 
 TOKEN_APP is sent through the X-Rennari-App-Token handshake header and
-checked in auth_cb.
+checked by the server before auth_cb runs.
 
 It checks possession of a shared application credential. It is not user
 authentication or proof that a connection comes from an approved program.

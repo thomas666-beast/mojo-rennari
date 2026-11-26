@@ -7,9 +7,11 @@ use Mojo::Rennari::Server;
 use Mojo::Rennari::Protocol qw(encode_frame decode_frame);
 use Mojolicious;
 
+my $APP = 'test-only-application-token-1234567890';
 my $app = Mojolicious->new;
 $app->log->level('fatal');
 my $server = Mojo::Rennari::Server->new(
+    app_token => $APP,
     recovery => 1,
     recovery_max_frames => 1,
     logger => $app->log,
@@ -23,6 +25,10 @@ my $connection;
 $server->on_connect(sub { $connection = $_[0]->rennari });
 $app->routes->websocket('/ws')->to(cb => sub { $server->websocket_route(shift) });
 my $t = Test::Mojo->new($app);
+
+$t->ua->on(start => sub {
+    $_[1]->req->headers->header('X-Rennari-App-Token' => $APP);
+});
 
 sub receive {
     my ($label) = @_;

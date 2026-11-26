@@ -5,7 +5,10 @@ use Mojo::Rennari::Protocol qw(encode_frame decode_frame);
 use Test::Mojo;
 use Mojolicious::Lite;
 
+my $APP = 'test-only-application-token-1234567890';
+
 my $rennari = Mojo::Rennari::Server->new(
+    app_token => $APP,
     auth_cb => sub {
         my $c = shift;
         my $token = $c->param('token') // return undef;
@@ -33,6 +36,10 @@ websocket '/ws' => sub {
 };
 
 my $t = Test::Mojo->new(app);
+
+$t->ua->on(start => sub {
+    $_[1]->req->headers->header('X-Rennari-App-Token' => $APP);
+});
 
 # --- echo ------------------------------------------------------------
 $t->websocket_ok('/ws?token=good')
